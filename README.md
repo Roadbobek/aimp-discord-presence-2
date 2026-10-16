@@ -18,7 +18,7 @@ C++17 plugin built with CMake 3.28 or newer and Visual Studio 2022 (or newer) bu
 
 ## Architecture
 
-The build produces one shared library, `aimp_discordPresence.dll`, from `src/*.cpp` plus the in-repo `aimp-glue` façade over the official AIMP SDK headers. Cover art resolves through four layers, stopping at the first usable image: art embedded in the file, a sidecar image in the track folder (up to four folders up), a keyless online lookup, and a plain black placeholder. The two local layers publish through an upload-host chain — an optional repo you own (used only when `CoverToken` is set), then catbox, uguu, and litterbox — so Discord can fetch the image; a host failure falls through to the online lookup, never straight to black. Presence is sent only when something changes, updates coalesce inside Discord's rate limit, and the plugin reconnects if Discord restarts without ever launching Discord itself.
+The build produces one shared library, `aimp_discordPresence.dll`, from `src/*.cpp` plus the in-repo `aimp-glue` façade over the official AIMP SDK headers. Cover art resolves through four layers, stopping at the first usable image: art embedded in the file, a sidecar image in the track folder (up to four folders up), a keyless online lookup, and no image — the field is omitted and Discord renders its native placeholder. The two local layers publish through an upload-host chain — an optional repo you own (used only when `CoverToken` is set), then catbox, uguu, and litterbox — so Discord can fetch the image; a host failure falls through to the online lookup, never straight to no-image. Presence is sent only when something changes, updates coalesce inside Discord's rate limit, and the plugin reconnects if Discord restarts without ever launching Discord itself.
 
 ## Getting started
 
@@ -61,7 +61,7 @@ Every configuration key is documented in [docs/BUILDING.md](docs/BUILDING.md).
 - The *Listening* activity type, so Discord says "Listening to AIMP".
 - Optional elapsed or remaining time, counted down client-side by Discord.
 - Small play, pause, and radio badges, each configurable.
-- Four-layer artwork resolution: embedded art, sidecar files, keyless online lookup, black placeholder.
+- Four-layer artwork resolution: embedded art, sidecar files, keyless online lookup, omitted image field (Discord's native placeholder) when all three fail.
 - Self-hosted cover publishing chain (own repo, then catbox, uguu, litterbox) for the local layers.
 - Plain ini-file configuration — no settings window; every key in `docs/BUILDING.md`.
 - No repeated text across presence lines, even for self-titled tracks.
@@ -75,9 +75,20 @@ Work happens on `main`. Cut a release from the [Releases page](https://github.co
 
 C++17, compiled warning-clean under `/W4 /WX` (warnings are errors — set in the root `cmakelists.txt`). Cover files found on disk are read, never decoded or rewritten.
 
+## Testing
+
+Offline unit tests in `tests/cover_publisher_tests.cpp` — they never touch the network. Build and run from the repository root:
+
+```powershell
+cl /nologo /std:c++17 /W4 /WX /EHsc tests\cover_publisher_tests.cpp src\album_art.cpp /link winhttp.lib
+cover_publisher_tests.exe [cache-directory]
+```
+
+The default cache directory is `%TEMP%\cover_publisher_cache_tests`; the run creates and removes its own scratch file inside it. `scripts\build-release.ps1` also builds and runs this suite (Phase 3: `test`) as part of the one-command release build.
+
 ## License
 
-No `LICENSE` file ships in this repo or upstream — original work © 2024 Exle, fork additions © 2026 nathwn12; free for personal use by anyone.
+The sources carry the upstream MIT permission notice (© 2024 Exle — see `src/discord_ipc.cpp` lines 1-19); no `LICENSE` file ships in this repo. Fork additions © 2026 nathwn12.
 
 ## Credits
 
