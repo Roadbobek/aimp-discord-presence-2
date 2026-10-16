@@ -1,103 +1,109 @@
+# AIMP Discord Presence
+
 <p align="center">
-  <img src="assets/icon.svg" width="120" height="120" alt="aimp-discord-presence2 icon" />
-</p>
-<h1 align="center">aimp-discord-presence2</h1>
-<p align="center"><strong>What you are listening to in AIMP, live on your Discord profile.</strong></p>
-<p align="center">
-  <img src="https://img.shields.io/github/languages/top/nathwn12/aimp-discord-presence2" alt="Language" />
-  <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Platform" />
+  <img src=".github/aimp-discord-312.png" alt="AIMP Discord Presence">
 </p>
 
-## Project name and description
+AIMP Discord Presence shows what you are listening to in [AIMP](https://www.aimp.ru)
+as a Discord Rich Presence, the same way Spotify does. As you play, pause, or
+switch tracks, Discord updates with the artist, the song, the album artwork, and
+- if you want it - the elapsed time. On your profile it appears as
+*Listening to* AIMP.
 
-aimp-discord-presence2 is an AIMP plugin that shows your current track in Discord as a Rich Presence — artist, song, album artwork, and optional elapsed time — the way Spotify does, appearing as *Listening to* AIMP. It is for AIMP users on Windows who run the Discord desktop client and want their playback visible without a settings window to click through. Configuration is a plain ini file, and cover art resolves through four local-and-online layers with a documented upload-host chain behind them.
+## Artwork
 
-## Technology stack
+The plugin resolves cover art through four layers, and stops at the first one
+that yields a usable image:
 
-C++17 plugin built with CMake 3.28 or newer and Visual Studio 2022 (or newer) build tools, 64-bit Windows only. The AIMP SDK arrives as a git submodule (`lib/aimp-sdk`); the glue over it (`lib/aimp-glue/`) is written in-repo. There is no Discord RPC library to fetch — Discord integration is implemented in-repo, with `src/discord_ipc.*` speaking Discord's local IPC protocol over the `\\.\pipe\discord-ipc-N` named pipe directly.
+1. **The art embedded in your file.** AIMP's own providers are asked first, so
+   the cover you already have is the cover Discord shows.
+2. **A sidecar image.** If the tags carry no art, the plugin looks for a
+   conventional cover file (`cover`, `folder`, `front`, `album`, `albumart`, or
+   Windows Media Player's `AlbumArtSmall`/`AlbumArt_{GUID}_Large`) in the track's
+   folder and up to four folders above it, so a multi-disc album whose art sits
+   at the album level still shows its cover. Cover files are read, never decoded
+   or rewritten.
+3. **A keyless online lookup.** If neither local layer produced art, the plugin
+   asks a few public music services for the cover. No accounts and no API keys
+   are involved, and you can turn this step off in the config.
+4. **A plain black placeholder.** If nothing is found, or online lookups are
+   disabled, the card gets a solid black image rather than an empty one.
 
-## Architecture
+The two local layers (embedded art and sidecar) publish the image through a
+small upload-host chain so Discord can fetch it: an optional GitHub repository
+you own, then catbox, uguu, and litterbox. The GitHub host is used only when you
+set `CoverToken` in the config; with an empty token it is omitted and the
+keyless hosts handle the upload. The upload hosts are all inside the local
+layers - a host failure still falls through to the online lookup, never straight
+to black. Every key, including `CoverToken` and `CoverRepo`, is documented in
+[docs/BUILDING.md](docs/BUILDING.md).
 
-The build produces one shared library, `aimp_discordPresence.dll`, from `src/*.cpp` plus the in-repo `aimp-glue` façade over the official AIMP SDK headers. Cover art resolves through four layers, stopping at the first usable image: art embedded in the file, a sidecar image in the track folder (up to four folders up), a keyless online lookup, and no image — the field is omitted and Discord renders its native placeholder. The two local layers publish through an upload-host chain — an optional repo you own (used only when `CoverToken` is set), then catbox, uguu, and litterbox — so Discord can fetch the image; a host failure falls through to the online lookup, never straight to no-image. Presence is sent only when something changes, updates coalesce inside Discord's rate limit, and the plugin reconnects if Discord restarts without ever launching Discord itself.
+## What you get
 
-## Getting started
-
-Prerequisites: 64-bit Windows, the Discord desktop client running (the browser version will not work), and AIMP.
-
-1. Download a built release archive from the [Releases page](https://github.com/nathwn12/aimp-discord-presence2/releases), or build it yourself (see below).
-2. In AIMP open Settings, go to Plugins, click Install, and point it at the release archive (or your built `aimp_discordPresence.dll`).
-3. Enable the plugin in the Plugins list, then restart AIMP.
-4. In Discord, under Settings → Activity Privacy, turn on "Share your detected activities with others" — nothing shows without this.
-5. Play something in AIMP; the presence appears on your profile.
-
-Build from source (Windows, VS2022+ build tools, CMake ≥ 3.28):
-
-```powershell
-git clone --recursive https://github.com/nathwn12/aimp-discord-presence2.git
-cd aimp-discord-presence2
-cmake -B build -A x64 -DAUTOVERSIONING=ON
-cmake --build build --config Release
-```
-
-Every configuration key is documented in [docs/BUILDING.md](docs/BUILDING.md).
-
-## Project structure
-
-- `src/` — plugin sources: presence core, four-layer art resolver, upload chain, Discord IPC, `version.rc` (copyright and version stamping).
-- `lib/aimp-glue/` — in-repo `Aimp::` C++ façade over the AIMP SDK headers; replaces the retired upstream wrapper.
-- `lib/aimp-sdk/` — official AIMP SDK, git submodule.
-- `tests/` — cover-publisher suite (`cover_publisher_tests.cpp`).
-- `scripts/` — `build-release.ps1` release-packaging helper.
-- `docs/` — `BUILDING.md` (install, build, every config key) and `preview/` (cards rendered from real captured payloads).
-- `.github/` — CMake build workflow (Win32 + x64, push/PR on `main`).
-- `build/` / `output/` — CMake tree and built plugin (both gitignored).
-- `cmakelists.txt` / `src/cmakelists.txt` / `src/product.version` — build roots and version stamp.
-- `.gitmodules` / `.gitignore` — submodule pointer and build-output ignores.
-- `README.md` — this file.
-
-## Key features
-
-- Discord Rich Presence while AIMP plays: artist, song, album, and artwork.
+- Discord Rich Presence while AIMP plays: artist, song, album and artwork.
 - The *Listening* activity type, so Discord says "Listening to AIMP".
-- Optional elapsed or remaining time, counted down client-side by Discord.
-- Small play, pause, and radio badges, each configurable.
-- Four-layer artwork resolution: embedded art, sidecar files, keyless online lookup, omitted image field (Discord's native placeholder) when all three fail.
-- Self-hosted cover publishing chain (own repo, then catbox, uguu, litterbox) for the local layers.
-- Plain ini-file configuration — no settings window; every key in `docs/BUILDING.md`.
-- No repeated text across presence lines, even for self-titled tracks.
-- Reconnects when Discord restarts; never launches Discord for you.
+- Optional elapsed or remaining time. Timestamps are absolute, so Discord counts
+  them down client-side, and presence is only sent when something changes.
+- Small play, pause and radio badges, each configurable. The radio badge carries
+  the text "Listening to URL".
+- Reconnection if Discord restarts, with updates coalesced to stay inside
+  Discord's rate limit. The plugin never launches Discord for you.
+- Configuration through a plain ini file, so there is no settings window to
+  click through. Every key is listed in [docs/BUILDING.md](docs/BUILDING.md).
 
-## Development workflow
+No line repeats a value already shown on another line, so a self-titled track
+cannot print the same text twice, and the default configuration shows the artist
+in the member-list status line.
 
-Work happens on `main`. Cut a release from the [Releases page](https://github.com/nathwn12/aimp-discord-presence2/releases) — that archive is what users install. CI builds Win32 and x64 with CMake on every push and pull request to `main`. The AIMP SDK submodule must be checked out (`--recursive`, or `git submodule update --init --recursive`) before configuring.
+## Install
 
-## Coding standards
+Download a built release from the
+[Releases page](https://github.com/nathwn12/aimp-discord-presence2/releases), or
+build it yourself. The full walkthrough - requirements, installing a release,
+building from source, and every configuration key - lives in
+[docs/BUILDING.md](docs/BUILDING.md).
 
-C++17, compiled warning-clean under `/W4 /WX` (warnings are errors — set in the root `cmakelists.txt`). Cover files found on disk are read, never decoded or rewritten.
+It runs on Windows and needs the Discord desktop client, running - the browser
+version of Discord will not work. In short: open AIMP's Settings, go to Plugins,
+click Install, and point it at the release archive (or at the
+`aimp_discordPresence.dll` you built), then restart AIMP. One Discord setting
+matters too: under Settings, Activity Privacy, "Share your detected activities
+with others" must be on, or nothing will show.
 
-## Testing
+## Screenshots
 
-Offline unit tests in `tests/cover_publisher_tests.cpp` — they never touch the network. Build and run from the repository root:
+![Screenshots](docs/preview/presence-preview.png)
 
-```powershell
-cl /nologo /std:c++17 /W4 /WX /EHsc tests\cover_publisher_tests.cpp src\album_art.cpp /link winhttp.lib
-cover_publisher_tests.exe [cache-directory]
-```
+These four cards are rendered from the plugin's real captured payloads: two
+tracks whose own artwork was used, a keyless online match, and the black
+placeholder after a real search returned nothing. They are not a screenshot of
+anyone's Discord account, and no avatar or username was invented.
 
-The default cache directory is `%TEMP%\cover_publisher_cache_tests`; the run creates and removes its own scratch file inside it. `scripts\build-release.ps1` also builds and runs this suite (Phase 3: `test`) as part of the one-command release build.
+## About this fork
 
-## License
+The original plugin is by **Exle**:
+<https://github.com/Exle/aimp-discord-presence>. Upstream has been quiet since
+June 2024, and this repository (`aimp-discord-presence2`) is where development
+continues now. It is not the official upstream, and nothing here suggests that
+Exle endorses it. The original design, the AIMP C++ wrapper design, and the
+shared Discord application ID all come from that work; this fork would not exist
+without it.
 
-The sources carry the upstream MIT permission notice (© 2024 Exle — see `src/discord_ipc.cpp` lines 1-19); no `LICENSE` file ships in this repo. Fork additions © 2026 nathwn12.
+One upstream piece is gone: Exle's `aimp-sdk-cpp-wrapper` repository has been
+deleted from GitHub, and a clone now fails with *Repository not found*. Because
+that source disappeared, this fork ships its own glue layer under
+`lib/aimp-glue/` - a small `Aimp::` C++ façade written directly over the AIMP SDK
+headers, to keep the project building. The wrapper design is still Exle's; only
+the implementation had to be replaced.
 
-## Credits
+## Personal use
 
-The original plugin is by [Exle](https://github.com/Exle/aimp-discord-presence); upstream has been quiet since June 2024 and this fork is where development continues. It is not the official upstream and nothing here suggests Exle endorses it. The original design, the wrapper design, and the shared Discord application ID are Exle's — including the `src/version.rc` copyright line kept in this tree. One upstream piece is gone (the deleted `aimp-sdk-cpp-wrapper`), so this fork ships its own glue under `lib/aimp-glue/`; only the implementation was replaced.
+This plugin is for personal use, and it is free to use by anyone. There is no
+licence file in this repository; the statement above is the whole of it. Credit
+for the original work belongs to Exle.
 
-<!-- nathwn12 house footer: identical in every repo. Do not edit. -->
-<p align="center">
-  <a href="https://github.com/nathwn12"><img src="assets/signature.svg" width="96" alt="nathwn12" /></a>
-</p>
-<p align="center">
-  <sub>Built by <a href="https://github.com/nathwn12">nathwn12</a> · <a href="https://github.com/nathwn12?tab=repositories">All projects</a></sub>
-</p>
+## Not in the AIMP catalogue
+
+This plugin is not published on AIMP's website and is not part of AIMP's official
+plugin catalogue - you will not find it there. Install it by hand, following
+[docs/BUILDING.md](docs/BUILDING.md).
