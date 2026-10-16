@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<style>html,body{margin:0;padding:0}svg{display:block;width:100vw;height:100vh}</style>
+<!-- Direction A: "cursor-n" — rounded lowercase n + terminal block cursor, near-black ground -->
+<rect x="16" y="16" width="480" height="480" rx="112" fill="#0B0F14"/>
+<path d="M136 384 L136 264 C136 196 180 164 234 164 C288 164 328 198 328 264 L328 384 L264 384 L264 270 C264 242 250 230 234 230 C218 230 200 242 200 270 L200 384 Z" fill="#EEF3F6"/>
+<rect x="352" y="312" width="52" height="72" rx="8" fill="#4DD4E8"/>
+</svg>
