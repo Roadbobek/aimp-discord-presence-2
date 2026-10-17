@@ -1,3 +1,7 @@
+> **Fork of [Exle/aimp-discord-presence](https://github.com/Exle/aimp-discord-presence).** Maintained line adding a multi-layer cover-art chain (embedded/sidecar/online lookup), a Spotify-parity presence card, and a portable build script.
+>
+> Upstream's README follows unchanged.
+
 # AIMP Discord Presence
 
 <p align="center">
