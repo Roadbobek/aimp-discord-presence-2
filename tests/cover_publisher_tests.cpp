@@ -745,6 +745,73 @@ void TestCoverFallbackChain() {
         "chain: literal aimp is never the resolved image");
 }
 
+// --- Card large_image: never empty (transparent placeholder) -----------------
+
+void TestCardLargeImagePlaceholder() {
+  using PresenceLayout::kTransparentLargeImageUrl;
+  using PresenceLayout::ResolveCardLargeImage;
+
+  // The placeholder URL is pinned once, so it cannot drift silently.
+  Check(std::string(kTransparentLargeImageUrl) ==
+            "https://raw.githubusercontent.com/nathwn12/aimp-discord-presence-art/"
+            "main/covers/transparent.png",
+        "card: the transparent placeholder url is pinned");
+  // AppendImageField truncates at 300 characters.
+  Check(std::strlen(kTransparentLargeImageUrl) < 300,
+        "card: the placeholder url fits the wire truncation limit");
+
+  const std::string key = AlbumArt::BuildAlbumKey("Daft Punk", "Discovery", "");
+  const std::string local_url = "https://litter.catbox.moe/ofx201.jpg";
+  const std::string online_url =
+      "https://e-cdns-images.dzcdn.net/images/cover/abc123/600x600-000000-80-0-0.jpg";
+  std::string source;
+
+  // (a) Nothing resolved and nothing keyed: the placeholder is sent and the
+  // resolver's own source verdict is unchanged.
+  const std::string no_cover = ResolveCardLargeImage(key, "", "", "", "", &source);
+  Check(no_cover == kTransparentLargeImageUrl, "card: no cover sends the placeholder");
+  Check(source == "none", "card: the placeholder keeps the resolver's none source");
+
+  // (b) A published local cover wins and is not replaced.
+  const std::string local_win =
+      ResolveCardLargeImage(key, key, local_url, key, online_url, &source);
+  Check(local_win == local_url && local_win != kTransparentLargeImageUrl,
+        "card: a local cover beats the placeholder");
+  Check(source == "local", "card: the local cover keeps its source");
+
+  // (c) No local cover: the online url is sent, not the placeholder.
+  const std::string online_win =
+      ResolveCardLargeImage(key, "", "", key, online_url, &source);
+  Check(online_win == online_url && online_win != kTransparentLargeImageUrl &&
+            !online_win.empty(),
+        "card: an online url beats the placeholder");
+  Check(source == "online", "card: the online url keeps its source");
+
+  // (d) A stale key is never adopted: the placeholder substitutes, never a url
+  // that belongs to another track.
+  const std::string other_key = AlbumArt::BuildAlbumKey("Daft Punk", "Homework", "");
+  const std::string stale =
+      ResolveCardLargeImage(key, other_key, local_url, other_key, online_url, &source);
+  Check(stale == kTransparentLargeImageUrl, "card: a stale key sends the placeholder");
+  Check(stale != local_url && stale != online_url,
+        "card: a stale key never sends another track's cover");
+  Check(source == "none", "card: the stale key keeps the resolver's none source");
+
+  // (e) Album-art display disabled: ResolveLargeImageLocked empties both urls by
+  // construction, and the card still carries the placeholder - disabled art is
+  // transparent, never yellow.
+  const std::string disabled = ResolveCardLargeImage(key, key, "", key, "", &source);
+  Check(disabled == kTransparentLargeImageUrl,
+        "card: art display disabled sends the placeholder");
+  Check(!disabled.empty(), "card: art display disabled never leaves the image empty");
+
+  // No input shape leaves the card image blank.
+  Check(!ResolveCardLargeImage("", "", "", "", "", nullptr).empty() &&
+            !ResolveCardLargeImage(key, key, "", "", "", nullptr).empty() &&
+            !ResolveCardLargeImage("", key, local_url, "", online_url, nullptr).empty(),
+        "card: no input combination leaves the image field empty");
+}
+
 // --- The explicit four-layer chain, in order -------------------------------
 
 void TestCoverLayerOrder() {
@@ -1522,6 +1589,7 @@ int main(int argc, char** argv) {
   TestBoundary();
   TestAlbumIdentityKeys();
   TestCoverFallbackChain();
+  TestCardLargeImagePlaceholder();
   TestCoverLayerOrder();
   TestPublishPendingNotBlank();
   TestOnlineRungDecision();

@@ -37,10 +37,13 @@
 //                        `{album}`), shown as the cover-art tooltip; omitted
 //                        when empty or shorter than Discord's 2-character
 //                        minimum
-//   large_image          the resolved album art URL; empty (omitted) when no
-//                        art was resolved, so Discord renders its native
-//                        placeholder (never an asset key, never a
-//                        stand-in image URL)
+//   large_image          the resolved album art URL; when no cover has resolved
+//                        yet (art missing or still loading, publish failed,
+//                        online lookup failed, or album-art display disabled)
+//                        the shared fully-transparent placeholder URL is sent
+//                        instead, so the card never falls back to Discord's
+//                        yellow native icon (never an asset key, never any
+//                        other stand-in image)
 //
 // No field repeats a value already emitted by an earlier one; empty values
 // count as absent.
@@ -53,15 +56,26 @@
 // track title - in the member-list status line.
 namespace PresenceLayout {
 
-// There is no stand-in image: when no album art URL was resolved the field
-// stays empty and is omitted from the wire JSON (AppendImageField skips
-// empties), so the card shows Discord's native placeholder. A bundled asset
-// key such as `aimp` must never be used either: it belongs to a Discord
-// application this plugin does NOT own, so it would resolve only while that
-// foreign application happens to serve it.
+// The one permitted stand-in is the shared transparent PNG below: the card
+// image is never empty. A resolved cover URL is preferred whenever one exists;
+// otherwise large_image carries the transparent placeholder, so Discord never
+// draws its yellow native icon. That is the only exception - no coloured or
+// branded image, and never a bundled asset key such as `aimp`: it belongs to a
+// Discord application this plugin does NOT own, so it would resolve only while
+// that foreign application happens to serve it.
 
 // Literal shown on line 2 when both the artist and track title tags are empty.
 constexpr const char* kFallbackDetails = "AIMP";
+
+// The single, shared fully-transparent PNG sent as large_image whenever no
+// cover has resolved (art missing or loading, publish failed, online lookup
+// failed, or album-art display disabled). Discord draws its yellow default icon
+// for a missing image, so the card always carries this URL instead of an empty
+// field. Defined exactly once in the tree; the URL is well under
+// AppendImageField's 300-character truncation limit.
+inline constexpr char kTransparentLargeImageUrl[] =
+    "https://raw.githubusercontent.com/nathwn12/aimp-discord-presence-art/"
+    "main/covers/transparent.png";
 
 // Every tag value a template may substitute. Populated from the same AIMP
 // file-info read that the card already uses, so a template never costs an
@@ -323,12 +337,14 @@ inline bool ShouldRequestOnlineArtwork(bool use_albumart, bool use_online,
 }
 
 // The large_image for `album_key` from the resolved sources: a published local
-// cover wins over the online chain's URL; when neither resolved the field is
-// empty (omitted on the wire). Each source is adopted only when its own key
+// cover wins over the online chain's URL; when neither resolved the result is
+// empty, and the caller (ResolveCardLargeImage below) substitutes the shared
+// transparent placeholder. Each source is adopted only when its own key
 // equals `album_key`, so a value resolved for one track identity can never be
 // shown for another. `album_key` is the only identity this needs, so an
 // album-less track resolves exactly like an albumed one. `source` names the
-// winner for the DebugLog when non-null.
+// winner for the DebugLog when non-null. Kept pure (an empty result is
+// meaningful here) so its tests assert the raw resolver's outcome.
 inline std::string ResolveLargeImage(const std::string& album_key,
                                      const std::string& local_cover_key,
                                      const std::string& local_cover_url,
@@ -353,6 +369,26 @@ inline std::string ResolveLargeImage(const std::string& album_key,
   return std::string();
 }
 
+// The large_image the card actually sends: ResolveLargeImage's winner, or the
+// shared transparent placeholder when the resolver produced nothing. The card
+// image is therefore never empty - no input leaves this helper blank, so
+// Discord never draws its yellow default icon. `source` still reports the
+// resolver's verdict ("local", "online" or "none"); "none" is exactly the case
+// that yields the placeholder.
+inline std::string ResolveCardLargeImage(const std::string& album_key,
+                                         const std::string& local_cover_key,
+                                         const std::string& local_cover_url,
+                                         const std::string& online_key,
+                                         const std::string& online_url,
+                                         std::string* source = nullptr) {
+  std::string resolved = ResolveLargeImage(album_key, local_cover_key, local_cover_url,
+                                           online_key, online_url, source);
+  if (resolved.empty()) {
+    resolved = kTransparentLargeImageUrl;
+  }
+  return resolved;
+}
+
 // The cover chain as four explicit layers, in priority order. This is the
 // single statement of the required fallback order; the resolver above is its
 // URL-producing form. A track descends the chain only by surviving every layer
@@ -365,8 +401,9 @@ enum class CoverLayer {
   kLocalSidecar = 2,
   // 3. The keyless online chain (Deezer / iTunes / MusicBrainz+CoverArtArchive).
   kOnlineKeyless = 3,
-  // 4. No image. Only reached when 1, 2 and 3 all fail; the field is omitted
-  // and Discord renders its native placeholder.
+  // 4. No image. Only reached when 1, 2 and 3 all fail; the card then sends the
+  //    shared transparent placeholder (never an empty field, never a stand-in
+  //    cover), so Discord does not draw its yellow native icon.
   kNoImage = 4,
 };
 

@@ -704,11 +704,14 @@ bool AimpDiscordPresence::ApplyPendingArtwork() {
 
 std::string AimpDiscordPresence::ResolveLargeImageLocked(const std::string& album_key,
                                                          std::string* source) const {
-  // The setting turns both sources off; no image is then sent.
+  // The setting turns both sources off. It no longer means "no image": the card
+  // stays honest either way, because the resolver's empty result is replaced by
+  // the shared transparent placeholder, never left empty (Discord would draw
+  // its yellow default icon). An empty string cannot leave this function.
   const std::string local_url = settings.use_albumart ? local_cover_url_ : std::string();
   const std::string online_url = settings.use_albumart ? artwork_url_ : std::string();
-  return PresenceLayout::ResolveLargeImage(album_key, local_cover_key_, local_url,
-                                           artwork_key_, online_url, source);
+  return PresenceLayout::ResolveCardLargeImage(album_key, local_cover_key_, local_url,
+                                               artwork_key_, online_url, source);
 }
 
 void AimpDiscordPresence::MaybePublishLocalCover(const TrackInfo& info,
