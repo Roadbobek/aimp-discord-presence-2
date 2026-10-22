@@ -21,7 +21,9 @@
 #ifndef AIMPDISCORDPRESENCE_SRC_AIMP_DISCORD_PRESENCE_H_
 #define AIMPDISCORDPRESENCE_SRC_AIMP_DISCORD_PRESENCE_H_
 
+#include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,6 +38,7 @@
 #include "album_art.h"
 #include "discord_ipc.h"
 #include "local_art.h"
+#include "presence_layout.h"
 
 class AimpDiscordPresence :
   public Aimp::Implements<Aimp::Plugin, Aimp::ExternalSettingsDialog> {
@@ -57,6 +60,8 @@ class AimpDiscordPresence :
     std::string title;
     std::string artist;
     std::string album;
+    std::string year;
+    std::string genre;
     // Full file path; the identity discriminator for album-less tracks.
     std::string file;
     bool is_url = false;
@@ -71,10 +76,25 @@ class AimpDiscordPresence :
   void InitializeMessageDispatcher();
 
  private:
-  // Rebuilds and queues the Discord presence. `request_artwork` starts a new
-  // album art lookup for the current track.
+  // Rebuilds the Discord presence. `request_artwork` starts a new album art
+  // lookup for the current track.
   void RefreshPresence(bool request_artwork);
+  // Builds the card and publishes it as the desired state. It never touches the
+  // Discord client: the throttle worker is the only sender.
   void SendActivity();
+
+  // Rate-limit plumbing. The worker is the only thread that calls SetActivity
+  // or Clear; every other path records the desired state and wakes it.
+  void StartThrottleWorker();
+  void StopThrottleWorker();
+  void ThrottleWorkerMain();
+  // Records "presence should be cleared" and resets the interval, so the clear
+  // is never held behind the track that just ended and the next playback
+  // publishes immediately. Caller holds throttle_mutex_.
+  void QueueClearLocked();
+  // Unload only: asks the worker to publish a clear and waits, bounded, for the
+  // clear to be acted on while the worker is still alive.
+  void ClearPresenceBeforeStop();
 
   TrackInfo ReadTrackInfo();
 
@@ -136,8 +156,23 @@ class AimpDiscordPresence :
     std::wstring cover_token;
     std::wstring cover_repo = L"nathwn12/aimp-discord-presence-art";
     // What the member-list status line shows: 0 = name, 1 = state (artist),
-    // 2 = details (track title). Defaults to 1, the artist in member list.
-    int status_display_type = 1;
+    // 2 = details (track title). Defaults to 2, the track title.
+    int status_display_type = 2;
+    // Activity card text templates. `name` is the application name line above
+    // the activity. Each button is emitted only when its url is an https://
+    // URL; token values in a Url are percent-encoded, labels are not.
+    std::wstring name = L"Music";
+    std::wstring details_template = L"{title}";
+    std::wstring state_template = L"{artist}";
+    std::wstring large_text_template = L"{album}";
+    std::wstring button1_label = L"Listen on Spotify";
+    std::wstring button1_url = L"https://open.spotify.com/search/";
+    std::wstring button2_label = L"Find on YouTube";
+    std::wstring button2_url = L"https://music.youtube.com/search?q=";
+    // Minimum milliseconds between activity updates. 0 disables the limit;
+    // every other value below 1000, negative included, is raised to 1000.
+    // Default 4000 stays under Discord's five-updates-per-20-seconds cap.
+    int throttle_ms = 4000;
     // Optional file for the Discord IPC frame log. Empty (the default) leaves
     // logging off. A bare filename resolves next to the plugin DLL; an
     // absolute path is used as given.
@@ -145,11 +180,15 @@ class AimpDiscordPresence :
     struct State {
       bool use_play = false;
       std::wstring play_image = L"aimp_play";
+      std::wstring play_text = L"Playing";
       bool use_pause = false;
       std::wstring pause_image = L"aimp_pause";
+      std::wstring pause_text = L"Paused";
       bool use_radio = true;
       std::wstring radio_image = L"https://raw.githubusercontent.com/Exle/aimp-discord-presence/main/"
                            L".github/aimp_icons/animated/aimp_radio.gif";
+      // Empty (the default) omits small_text in radio state.
+      std::wstring radio_text;
     };
     State status;
   };
@@ -178,6 +217,9 @@ class AimpDiscordPresence :
   std::string track_album_;
   // Identity discriminator for album-less tracks; AIMP message thread only.
   std::string track_file_;
+  // Tag values of the track the card currently describes, for button template
+  // expansion. AIMP message thread only.
+  PresenceLayout::TrackFields track_fields_;
   std::string last_large_image_;
   // Last track whose local cover was fingerprinted; AIMP message thread only.
   std::string local_art_key_;
@@ -188,8 +230,14 @@ class AimpDiscordPresence :
   // the publisher's on-disk cache is consulted on the worker, where blocking
   // for a moment is allowed. AIMP message thread only.
   std::unordered_map<std::string, std::string> local_cover_urls_;
-  double sent_position_ = 0.0;
-  int64_t sent_at_seconds_ = 0;
+  // Baseline of the activity Discord is showing: the player position and the
+  // wall-clock second the card was built for. Written by the throttle worker
+  // after a real SetActivity (never after a Clear), and read by the seek check
+  // on the message thread, so both members are relaxed atomics: the seek check
+  // takes no lock, and the pair only has to be individually intact, not
+  // consistent as a unit.
+  std::atomic<double> sent_position_{0.0};
+  std::atomic<int64_t> sent_at_seconds_{0};
   bool paused_ = false;
 
   // Publisher worker plumbing. The worker is handed bytes, a mime and a hash;
@@ -214,6 +262,28 @@ class AimpDiscordPresence :
   std::string cover_result_detail_;
   // Which upload host produced this outcome (winner on ok, last tried on fail).
   std::string cover_result_host_;
+
+  // Throttle worker: the only thread that calls into the Discord client. The
+  // message thread writes the desired state and bumps desired_revision_; the
+  // worker publishes at most one update per interval and compares revisions so
+  // a request that arrived during a client call is never lost. No client call
+  // is made while this mutex is held.
+  std::thread throttle_worker_;
+  std::mutex throttle_mutex_;
+  std::condition_variable throttle_wake_;
+  bool throttle_stopping_ = false;
+  // false means "presence should be cleared"; `desired_activity_` and the
+  // baseline pair below belong to the same request.
+  bool desired_valid_ = false;
+  uint64_t desired_revision_ = 0;
+  uint64_t last_sent_revision_ = 0;
+  uint64_t throttle_last_sent_ms_ = 0;
+  DiscordIpc::Activity desired_activity_;
+  // Seek baseline that belongs to the desired activity, captured with it on the
+  // message thread so the worker can publish a fresh baseline without ever
+  // touching an AIMP object.
+  double desired_position_ = 0.0;
+  int64_t desired_at_seconds_ = 0;
 };
 
 #endif  // AIMPDISCORDPRESENCE_SRC_AIMP_DISCORD_PRESENCE_H_

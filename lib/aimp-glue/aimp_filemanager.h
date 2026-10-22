@@ -33,6 +33,10 @@ class FileInfo {
       kTitle = AIMP_FILEINFO_PROPID_TITLE,
       kArtist = AIMP_FILEINFO_PROPID_ARTIST,
       kAlbum = AIMP_FILEINFO_PROPID_ALBUM,
+      // DATE is the year/date tag AIMP exposes; it is a string ("2004" or a
+      // full date), so the plugin substitutes it verbatim.
+      kDate = AIMP_FILEINFO_PROPID_DATE,
+      kGenre = AIMP_FILEINFO_PROPID_GENRE,
       kFileName = AIMP_FILEINFO_PROPID_FILENAME,
     };
   };

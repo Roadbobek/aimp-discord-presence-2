@@ -118,12 +118,35 @@ void AppendTextField(std::string& json, const char* key, const std::string& valu
   AppendEscapedField(json, key, normalized);
 }
 
+// An optional caption (large_text, small_text). Discord's text fields have a
+// two-character minimum; unlike details/state, a one-character caption is
+// omitted rather than padded, because an empty tooltip is better than an
+// invalid one.
+void AppendOptionalTextField(std::string& json, const char* key,
+                             const std::string& value) {
+  if (value.empty() || TruncateUtf8(value, 1).size() == value.size()) {
+    return;
+  }
+  AppendTextField(json, key, value);
+}
+
 void AppendImageField(std::string& json, const char* key, const std::string& value) {
   const std::string normalized = TruncateUtf8(value, kImageFieldMaxLength);
   if (normalized.empty()) {
     return;
   }
   AppendEscapedField(json, key, normalized);
+}
+
+// The only URL scheme Discord accepts on an activity button (http is not
+// accepted by the client).
+constexpr char kButtonUrlScheme[] = "https://";
+// Shown when a configured button label is empty after truncation: Discord
+// rejects a button without a label.
+constexpr char kDefaultButtonLabel[] = "Listen";
+
+bool IsPresentButtonUrl(const std::string& url) {
+  return url.compare(0, sizeof(kButtonUrlScheme) - 1, kButtonUrlScheme) == 0;
 }
 
 // --- Minimal JSON reader ---------------------------------------------------
@@ -485,10 +508,12 @@ std::string BuildActivityJson(const Activity& activity) {
 
   std::string assets;
   AppendImageField(assets, "large_image", activity.large_image);
-  // Spotify parity: two text lines only - the album third line (`large_text`)
-  // is never emitted; the cover art image (`large_image`) is kept.
   AppendImageField(assets, "small_image", activity.small_image);
-  AppendTextField(assets, "small_text", activity.small_text);
+  AppendOptionalTextField(assets, "small_text", activity.small_text);
+  // large_text is the cover-art tooltip (the album by default). It is appended
+  // after the pre-existing asset fields so their wire order is untouched; it is
+  // emitted only when configured and at least two characters long.
+  AppendOptionalTextField(assets, "large_text", activity.large_text);
   if (!assets.empty()) {
     json += ",\"assets\":{";
     json += assets.substr(1);  // drop the leading comma the helpers prepend
@@ -498,6 +523,46 @@ std::string BuildActivityJson(const Activity& activity) {
   if (activity.status_display_type >= 0 && activity.status_display_type <= 2) {
     json += ",\"status_display_type\":";
     json += std::to_string(activity.status_display_type);
+  }
+
+  // `name` and `buttons` are appended last so the wire order of every field
+  // above stays byte-identical. A button is present only when its url is an
+  // https:// URL; its label is truncated, and an empty label becomes "Listen"
+  // because Discord drops a button that has no label.
+  if (!activity.name.empty()) {
+    AppendEscapedField(json, "name",
+                       TruncateUtf8(activity.name, kActivityNameMaxLength));
+  }
+
+  std::string buttons;
+  size_t emitted_buttons = 0;
+  for (const ActivityButton& button : activity.buttons) {
+    if (emitted_buttons >= kMaxActivityButtons) {
+      break;
+    }
+    if (!IsPresentButtonUrl(button.url)) {
+      continue;
+    }
+
+    std::string label = TruncateUtf8(button.label, kButtonLabelMaxLength);
+    if (label.empty()) {
+      label = kDefaultButtonLabel;
+    }
+
+    if (!buttons.empty()) {
+      buttons += ",";
+    }
+    buttons += "{\"label\":\"";
+    buttons += EscapeJsonString(label);
+    buttons += "\",\"url\":\"";
+    buttons += EscapeJsonString(TruncateUtf8(button.url, kButtonUrlMaxLength));
+    buttons += "\"}";
+    ++emitted_buttons;
+  }
+  if (!buttons.empty()) {
+    json += ",\"buttons\":[";
+    json += buttons;
+    json += "]";
   }
 
   json += "}";

@@ -32,6 +32,8 @@
 #include "aimp_player.h"
 #include "cover_publisher.h"
 #include "presence_layout.h"
+#include "presence_rate_limit.h"
+#include "presence_throttle_plan.h"
 #include "utils.h"
 
 namespace {
@@ -60,10 +62,20 @@ constexpr double kSeekDriftSeconds = 3.0;
 // passes is downscaled and re-encoded before transfer.
 constexpr size_t kMaxCoverBytes = 20 * 1024 * 1024;
 
+// Unload asks the throttle worker to publish a presence clear and waits this
+// long for it. The client call only queues a frame (the client's own worker
+// writes it), so the wait is a formality; the bound exists so a wedged client
+// can never hold AIMP's unload open.
+constexpr int kPresenceClearOnUnloadTimeoutMs = 2000;
+
 int64_t UnixSecondsNow() {
   return std::chrono::duration_cast<std::chrono::seconds>(
              std::chrono::system_clock::now().time_since_epoch())
       .count();
+}
+
+uint64_t MonotonicMillisNow() {
+  return static_cast<uint64_t>(GetTickCount64());
 }
 
 bool IsStreamUrl(const std::wstring& url) {
@@ -208,6 +220,10 @@ bool AimpDiscordPresence::Load() {
   // handed, and it is joined in Unload().
   cover_worker_ = std::thread(&AimpDiscordPresence::CoverWorkerMain, this);
 
+  // Rate-limit worker: publishes a deferred update on its trailing edge. It
+  // only reads the already-built activity and the IPC client, never AIMP.
+  StartThrottleWorker();
+
   album_art_.SetCallback(
       [this](const std::string& artist, const std::string& album,
              const std::string& file_path, const std::string& url) {
@@ -237,13 +253,25 @@ void AimpDiscordPresence::LoadConfig() {
   LoadConfigValue(config, L"DiscordPresence\\CoverToken", &settings.cover_token);
   LoadConfigValue(config, L"DiscordPresence\\CoverRepo", &settings.cover_repo);
   LoadConfigValue(config, L"DiscordPresence\\StatusDisplayType", &settings.status_display_type);
+  LoadConfigValue(config, L"DiscordPresence\\Name", &settings.name);
+  LoadConfigValue(config, L"DiscordPresence\\Details", &settings.details_template);
+  LoadConfigValue(config, L"DiscordPresence\\State", &settings.state_template);
+  LoadConfigValue(config, L"DiscordPresence\\LargeText", &settings.large_text_template);
+  LoadConfigValue(config, L"DiscordPresence\\Button1.Label", &settings.button1_label);
+  LoadConfigValue(config, L"DiscordPresence\\Button1.Url", &settings.button1_url);
+  LoadConfigValue(config, L"DiscordPresence\\Button2.Label", &settings.button2_label);
+  LoadConfigValue(config, L"DiscordPresence\\Button2.Url", &settings.button2_url);
+  LoadConfigValue(config, L"DiscordPresence\\ThrottleMs", &settings.throttle_ms);
   LoadConfigValue(config, L"DiscordPresence\\DebugLog", &settings.debug_log);
   LoadConfigValue(config, L"DiscordPresence\\State.UsePlay", &settings.status.use_play);
   LoadConfigValue(config, L"DiscordPresence\\State.PlayImage", &settings.status.play_image);
+  LoadConfigValue(config, L"DiscordPresence\\State.PlayText", &settings.status.play_text);
   LoadConfigValue(config, L"DiscordPresence\\State.UsePause", &settings.status.use_pause);
   LoadConfigValue(config, L"DiscordPresence\\State.PauseImage", &settings.status.pause_image);
+  LoadConfigValue(config, L"DiscordPresence\\State.PauseText", &settings.status.pause_text);
   LoadConfigValue(config, L"DiscordPresence\\State.UseRadio", &settings.status.use_radio);
   LoadConfigValue(config, L"DiscordPresence\\State.RadioImage", &settings.status.radio_image);
+  LoadConfigValue(config, L"DiscordPresence\\State.RadioText", &settings.status.radio_text);
 }
 
 void AimpDiscordPresence::InitializeMessageDispatcher() {
@@ -295,8 +323,15 @@ bool AimpDiscordPresence::Unload() {
   // Joins the artwork worker, so no callback can touch this plugin afterwards.
   album_art_.Shutdown();
 
+  // Stop the throttle worker before the client goes away. A queued update must
+  // not be published while the plugin unloads, and the clear is published by
+  // the worker itself, while it is still alive, so the message thread never
+  // touches the client. The client's own Shutdown() then clears deliberately on
+  // a live connection as its last act, which also covers a timed-out wait.
+  ClearPresenceBeforeStop();
+  StopThrottleWorker();
+
   if (client_) {
-    client_->Clear();
     client_->Shutdown();
     client_.reset();
   }
@@ -311,10 +346,17 @@ void AimpDiscordPresence::OnPlayerState(DWORD, int param1) {
   if (param1 == kPlayerStateStopped ||
       (param1 == kPlayerStatePaused && !settings.status.use_pause)) {
     track_key_.clear();
-    sent_at_seconds_ = 0;
-    if (client_) {
-      client_->Clear();
+    // The worker is the only sender: record that presence must go away and
+    // wake it. A queued update must not resurrect the presence after the clear,
+    // and the next playback should publish immediately rather than wait out an
+    // interval that belonged to the previous track, so the revision is bumped
+    // and the interval reset together.
+    {
+      std::lock_guard<std::mutex> lock(throttle_mutex_);
+      sent_at_seconds_.store(0, std::memory_order_relaxed);
+      QueueClearLocked();
     }
+    throttle_wake_.notify_one();
     return;
   }
 
@@ -348,9 +390,12 @@ void AimpDiscordPresence::OnPropertyValue(DWORD, int param1) {
 
   // Seek: the timestamps are absolute, so Discord counts down by itself and no
   // periodic update is required. Only a real drift triggers a new update.
-  if (sent_at_seconds_ != 0) {
-    const double elapsed = static_cast<double>(UnixSecondsNow() - sent_at_seconds_);
-    if (std::fabs(player.Position() - (sent_position_ + elapsed)) > kSeekDriftSeconds) {
+  if (sent_at_seconds_.load(std::memory_order_relaxed) != 0) {
+    const double elapsed = static_cast<double>(
+        UnixSecondsNow() - sent_at_seconds_.load(std::memory_order_relaxed));
+    if (std::fabs(player.Position() -
+                  (sent_position_.load(std::memory_order_relaxed) + elapsed)) >
+        kSeekDriftSeconds) {
       RefreshPresence(false);
       return;
     }
@@ -385,8 +430,15 @@ AimpDiscordPresence::TrackInfo AimpDiscordPresence::ReadTrackInfo() {
   const std::wstring file_name =
       fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kFileName);
   info.title = Utils::ToString(fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kTitle));
-  info.artist = Utils::ToString(fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kArtist));
+  // AIMP joins a multi-value artist tag with bare commas; normalise once here
+  // so every consumer (card, templates, identity key) sees ", ".
+  info.artist = PresenceLayout::NormalizeArtistSeparators(
+      Utils::ToString(fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kArtist)));
   info.album = Utils::ToString(fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kAlbum));
+  info.year = Utils::ToString(
+      fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kDate));
+  info.genre = Utils::ToString(
+      fileinfo.Get<std::wstring>(Aimp::FileManager::FileInfo::Props::kGenre));
   info.file = Utils::ToString(file_name);
   info.is_url = IsStreamUrl(file_name);
   info.key = info.artist + "\n" + info.album + "\n" + info.title;
@@ -464,12 +516,20 @@ void AimpDiscordPresence::RefreshPresence(bool request_artwork) {
 void AimpDiscordPresence::SetInfo(const TrackInfo& info) {
   activity_.type = static_cast<int>(DiscordIpc::ActivityType::kListening);
   activity_.status_display_type = settings.status_display_type;
+  activity_.name = Utils::ToString(settings.name);
 
-  // Title-prominent (Spotify parity): details is the track title (falling
-  // back to the artist), state is the artist, and the album is the
-  // large-image tooltip. Empty values omit their field.
-  const PresenceLayout::TextFields fields =
-      PresenceLayout::BuildTextFields(info.artist, info.album, info.title);
+  // Tag values for the configurable templates. Populated here so the button
+  // templates in SendActivity() expand against the same track as the card.
+  track_fields_.title = info.title;
+  track_fields_.artist = info.artist;
+  track_fields_.album = info.album;
+  track_fields_.year = info.year;
+  track_fields_.genre = info.genre;
+
+  const PresenceLayout::TextFields fields = PresenceLayout::BuildTextFields(
+      track_fields_, Utils::ToString(settings.details_template),
+      Utils::ToString(settings.state_template),
+      Utils::ToString(settings.large_text_template));
   activity_.details = fields.details;
   activity_.state = fields.state;
   activity_.large_text = fields.large_text;
@@ -485,29 +545,30 @@ void AimpDiscordPresence::SetInfo(const TrackInfo& info) {
 }
 
 void AimpDiscordPresence::SetSmallImage(const TrackInfo& info, int state) {
-  activity_.small_image.clear();
-  activity_.small_text.clear();
-
   Aimp::Player::Service::Player player;
   if (state == -1) {
     state = player.State();
   }
 
-  std::string small_image;
-  if (state == kPlayerStatePaused) {
-    if (settings.status.use_pause && !settings.status.pause_image.empty()) {
-      small_image = Utils::ToString(settings.status.pause_image);
-    }
-  } else if (state == kPlayerStatePlaying) {
-    if (info.is_url && settings.status.use_radio && !settings.status.radio_image.empty()) {
-      small_image = Utils::ToString(settings.status.radio_image);
-      activity_.small_text = "Listening to URL";
-    } else if (settings.status.use_play && !settings.status.play_image.empty()) {
-      small_image = Utils::ToString(settings.status.play_image);
-    }
-  }
+  // One switch decides both the image and its text, so the label always
+  // describes the badge actually shown. A configured label shorter than two
+  // characters is cleared by the selector, which omits the field instead of
+  // sending a value Discord rejects.
+  PresenceLayout::SmallBadgeSettings badge_settings;
+  badge_settings.use_play = settings.status.use_play;
+  badge_settings.play_image = Utils::ToString(settings.status.play_image);
+  badge_settings.play_text = Utils::ToString(settings.status.play_text);
+  badge_settings.use_pause = settings.status.use_pause;
+  badge_settings.pause_image = Utils::ToString(settings.status.pause_image);
+  badge_settings.pause_text = Utils::ToString(settings.status.pause_text);
+  badge_settings.use_radio = settings.status.use_radio;
+  badge_settings.radio_image = Utils::ToString(settings.status.radio_image);
+  badge_settings.radio_text = Utils::ToString(settings.status.radio_text);
 
-  activity_.small_image = small_image;
+  const PresenceLayout::SmallBadge badge =
+      PresenceLayout::SelectSmallBadge(info.is_url, state, badge_settings);
+  activity_.small_image = badge.image;
+  activity_.small_text = badge.text;
 }
 
 void AimpDiscordPresence::SetTimestamp(const TrackInfo& info) {
@@ -850,11 +911,206 @@ void AimpDiscordPresence::SendActivity() {
     snapshot = activity_;
   }
 
-  Aimp::Player::Service::Player player;
-  sent_position_ = player.Position();
-  sent_at_seconds_ = UnixSecondsNow();
+  // Buttons come from config. Their token values are expanded against the
+  // current track; Url templates are percent-encoded, labels are not. The
+  // builder still enforces the https-only rule and Discord's length limits.
+  snapshot.buttons[0].label = PresenceLayout::FormatTemplate(
+      Utils::ToString(settings.button1_label), track_fields_, false);
+  snapshot.buttons[0].url = PresenceLayout::FormatTemplate(
+      Utils::ToString(settings.button1_url), track_fields_, true);
+  snapshot.buttons[1].label = PresenceLayout::FormatTemplate(
+      Utils::ToString(settings.button2_label), track_fields_, false);
+  snapshot.buttons[1].url = PresenceLayout::FormatTemplate(
+      Utils::ToString(settings.button2_url), track_fields_, true);
 
-  if (client_) {
-    client_->SetActivity(snapshot);
+  Aimp::Player::Service::Player player;
+  const double position = player.Position();
+  const int64_t now_seconds = UnixSecondsNow();
+
+  // Record what should be on screen and wake the only sender. The gate and the
+  // client call belong to the worker now, so this path cannot interleave with a
+  // send in flight; a newer state simply replaces this one and bumps the
+  // revision again, and the worker publishes the newest at the deadline.
+  {
+    std::lock_guard<std::mutex> lock(throttle_mutex_);
+    desired_activity_ = std::move(snapshot);
+    desired_position_ = position;
+    desired_at_seconds_ = now_seconds;
+    desired_valid_ = true;
+    ++desired_revision_;
+  }
+  throttle_wake_.notify_one();
+}
+
+void AimpDiscordPresence::StartThrottleWorker() {
+  {
+    // A reload after Unload must start a fresh gate and a fresh revision
+    // sequence: the previous stop flag, desired state and interval belong to
+    // the old session. Safe because the previous worker was joined in Unload.
+    std::lock_guard<std::mutex> lock(throttle_mutex_);
+    throttle_stopping_ = false;
+    desired_valid_ = false;
+    desired_activity_ = DiscordIpc::Activity();
+    desired_revision_ = 0;
+    last_sent_revision_ = 0;
+    throttle_last_sent_ms_ = 0;
+    desired_position_ = 0.0;
+    desired_at_seconds_ = 0;
+  }
+  throttle_worker_ = std::thread(&AimpDiscordPresence::ThrottleWorkerMain, this);
+}
+
+void AimpDiscordPresence::StopThrottleWorker() {
+  {
+    std::lock_guard<std::mutex> lock(throttle_mutex_);
+    throttle_stopping_ = true;
+    // Bump the revision as well as setting the flag: a worker that is past its
+    // stop check must see a revision that is not the one it published, so the
+    // next iteration re-reads state instead of assuming it is idle. The stop
+    // flag is what actually ends the loop.
+    ++desired_revision_;
+  }
+  throttle_wake_.notify_all();
+  if (throttle_worker_.joinable()) {
+    throttle_worker_.join();
+  }
+}
+
+void AimpDiscordPresence::QueueClearLocked() {
+  desired_valid_ = false;
+  desired_activity_ = DiscordIpc::Activity();
+  ++desired_revision_;
+  // The gate belonged to the track that just ended: a clear is never held
+  // behind it, and the next playback publishes immediately. A worker whose send
+  // is already in flight will not overwrite this reset (GateAfterAction), so
+  // the clear it superseded is issued on the next iteration.
+  throttle_last_sent_ms_ = 0;
+}
+
+void AimpDiscordPresence::ClearPresenceBeforeStop() {
+  if (!throttle_worker_.joinable() || !client_) {
+    return;
+  }
+
+  std::unique_lock<std::mutex> lock(throttle_mutex_);
+  if (throttle_stopping_) {
+    return;
+  }
+
+  QueueClearLocked();
+  const uint64_t clear_revision = desired_revision_;
+  throttle_wake_.notify_one();
+
+  // The worker acts on the clear while it is still alive; after the join no
+  // client call can come from this plugin. The predicate is the worker's own
+  // completion condition, re-checked under this mutex, so the completion's
+  // notify_all cannot be missed.
+  throttle_wake_.wait_for(
+      lock, std::chrono::milliseconds(kPresenceClearOnUnloadTimeoutMs),
+      [this, clear_revision] {
+        return throttle_stopping_ || last_sent_revision_ >= clear_revision;
+      });
+
+  const bool published = last_sent_revision_ >= clear_revision;
+  lock.unlock();
+  if (!published) {
+    // Not fatal: Client::Shutdown() clears the presence on a live READY
+    // connection as its own last act.
+    LogCover("presence clear on unload timed out; relying on client shutdown");
+  }
+}
+
+void AimpDiscordPresence::ThrottleWorkerMain() {
+  std::unique_lock<std::mutex> lock(throttle_mutex_);
+  for (;;) {
+    if (throttle_stopping_) {
+      return;
+    }
+
+    PresenceThrottlePlan::Request request;
+    request.desired_valid = desired_valid_;
+    request.desired_revision = desired_revision_;
+    request.last_sent_revision = last_sent_revision_;
+    request.last_sent_ms = throttle_last_sent_ms_;
+
+    const uint32_t interval =
+        PresenceRateLimit::NormalizeThrottleMs(settings.throttle_ms);
+    const PresenceThrottlePlan::Decision decision = PresenceThrottlePlan::Decide(
+        request, MonotonicMillisNow(), interval);
+
+    if (decision.action == PresenceThrottlePlan::Action::kIdle) {
+      // Idle means the published revision is the desired one. Any bump makes
+      // them differ again, so that equality is the wake predicate; a spurious
+      // wake only re-evaluates it under the lock.
+      throttle_wake_.wait(lock, [this] {
+        return throttle_stopping_ || desired_revision_ != last_sent_revision_;
+      });
+      continue;
+    }
+
+    if (decision.action == PresenceThrottlePlan::Action::kWait) {
+      // Bounded by the deadline. A bump wakes us earlier and the loop decides
+      // again against the newer revision, so an old wait never masks newer
+      // state; the predicate is the revision we decided on.
+      const uint64_t observed_revision = desired_revision_;
+      throttle_wake_.wait_for(
+          lock, std::chrono::milliseconds(static_cast<int64_t>(decision.wait_ms)),
+          [this, observed_revision] {
+            return throttle_stopping_ || desired_revision_ != observed_revision;
+          });
+      continue;
+    }
+
+    // Act on exactly the state this decision was made from, then re-check: the
+    // revision proves whether a newer request arrived while the call was in
+    // flight.
+    const uint64_t acted_revision = desired_revision_;
+    const bool clear =
+        decision.action == PresenceThrottlePlan::Action::kClear;
+    const uint64_t gate_before = throttle_last_sent_ms_;
+    DiscordIpc::Activity snapshot;
+    double position = 0.0;
+    int64_t at_seconds = 0;
+    if (!clear) {
+      snapshot = desired_activity_;
+      position = desired_position_;
+      at_seconds = desired_at_seconds_;
+    }
+
+    // The client takes its own mutex, so it is never called with this one held.
+    // One call, no retry: a failure is the client's to recover from, and the
+    // revision below is still recorded so the loop cannot spin on it.
+    lock.unlock();
+    if (client_) {
+      if (clear) {
+        client_->Clear();
+      } else {
+        client_->SetActivity(snapshot);
+      }
+    }
+    if (!clear) {
+      // A deferred send is a send: it moves the seek baseline to the values the
+      // card was built from. Relaxed atomics read by the seek check, so neither
+      // store needs the lock and their order after the call does not matter.
+      sent_position_.store(position, std::memory_order_relaxed);
+      sent_at_seconds_.store(at_seconds, std::memory_order_relaxed);
+    } else {
+      // No card is on screen now. The request already reset this, but a stale
+      // send that completed after the request must not leave a baseline
+      // pointing at a card the clear then removed.
+      sent_at_seconds_.store(0, std::memory_order_relaxed);
+    }
+    lock.lock();
+
+    // The published revision is the one the call acted on, not the current one:
+    // if a clear arrived during the call this is already stale, the next
+    // decision sees the difference, and the clear is issued. The interval gate
+    // keeps whatever a clear set while the call was in flight.
+    last_sent_revision_ = acted_revision;
+    throttle_last_sent_ms_ = PresenceThrottlePlan::GateAfterAction(
+        decision.action, gate_before, throttle_last_sent_ms_,
+        MonotonicMillisNow());
+    // A drain waiting on the unload clear observes this completion.
+    throttle_wake_.notify_all();
   }
 }

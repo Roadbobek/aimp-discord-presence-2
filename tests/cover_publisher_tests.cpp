@@ -666,8 +666,11 @@ void TestAlbumIdentityKeys() {
 
   // The caption is still governed by the album tag alone: only the image
   // survives an empty album, never large_text.
-  const PresenceLayout::TextFields fields =
-      PresenceLayout::BuildTextFields(artist, "", "LOVELY BASTARDS");
+  PresenceLayout::TrackFields caption_track;
+  caption_track.artist = artist;
+  caption_track.title = "LOVELY BASTARDS";
+  const PresenceLayout::TextFields fields = PresenceLayout::BuildTextFields(
+      caption_track, "{title}", "{artist}", "{album}");
   Check(fields.large_text.empty(), "an album-less track still omits the large_text caption");
 
   // Two album-less files by one artist are two identities, and one's cover is

@@ -67,6 +67,15 @@ output/Release/aimp_discordPresence/x64/aimp_discordPresence.dll
 Install that DLL using the manual steps above (AIMP ▸ Settings ▸ Plugins ▸
 Install).
 
+### Tests
+
+The offline payload tests build as a separate `payload_tests` target and are
+registered with CTest. They need no network, AIMP, or Discord client:
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure
+```
+
 ## Configuration
 
 Configuration is **ini-only** - there is no settings UI. Settings live in AIMP's
@@ -86,14 +95,46 @@ find the Profile folder location in AIMP's settings.)
 | `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes, then MusicBrainz + Cover Art Archive). `0` = never go online; always use the black fallback image. `1` = allow online lookups. |
 | `LocalCover`, `CoverCache` | bool, string | Publish the track's own (offline) cover so Discord can fetch the real artwork. `LocalCover`: `0` = off, `1` = on (default); a published cover is used only after the upload proves retrievable. The local image is uploaded through a host chain - GitHub (only when `CoverToken` is set), catbox, uguu, then litterbox - and a host failure falls through to the online lookup, never straight to black. `CoverCache`: optional file that remembers published cover URLs by image hash. Empty (the default) resolves to `cover-cache.txt` beside the plugin DLL; a bare filename resolves there too, an absolute path is used as given. |
 | `CoverToken`, `CoverRepo` | string, string | **Optional** permanent GitHub upload host. `CoverToken` is a fine-grained personal access token with `contents: write` for the repository. An **empty token (the default) is fine**: it simply omits the GitHub host, and the keyless hosts handle the upload with no behaviour change. When set, GitHub is tried first, and the token is sent **only** to `api.github.com`; it is never logged, printed, or written to `CoverCache`. `CoverRepo`: the `owner/name` repository that receives the covers; empty (the default) uses `nathwn12/aimp-discord-presence-art`. |
-| `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **song title** (the `state` line), `2` = **artist** (default). |
+| `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **artist** (the `state` line), `2` = **track title** (the `details` line). Default: `2`. |
+| `Name` | string | Application name shown above the activity card. Default: `Music`. Truncated to 128 characters; an empty value omits the field. |
+| `Details` | string | Template for line 2 of the card. Default: `{title}`. An empty expansion falls back to the artist, then to `AIMP`, so the line is never blank. |
+| `State` | string | Template for line 3 of the card. Default: `{artist}`. An empty expansion falls back to the album; the line is omitted when it would repeat `Details`. |
+| `LargeText` | string | Template for the cover-art tooltip. Default: `{album}`. Omitted when it expands to fewer than two characters. |
+| `Button1.Label`, `Button1.Url` | string, string | First link button. Defaults: `Listen on Spotify` and `https://open.spotify.com/search/`. A button is shown only when its url is an `https://` URL; the label is truncated to 32 characters (an empty label becomes `Listen`) and the url to 512. Both fields accept template tokens; **Url token values are percent-encoded, labels are not**. |
+| `Button2.Label`, `Button2.Url` | string, string | Second link button. Defaults: `Find on YouTube` and `https://music.youtube.com/search?q=`. Same https-only rule, templates and limits as the first button. |
+| `ThrottleMs` | int | Minimum milliseconds between presence updates. Default: `4000` (five updates per 20 seconds, Discord's cap). `0` disables the limit; any non-zero value below `1000` - negative included - is raised to `1000`; values `>= 1000` are used as-is. An update that arrives early is remembered and the **latest** state is sent when the interval expires. |
 | `DebugLog` | string | Optional file that receives the Discord IPC frame log, for diagnosing connection problems. Empty (the default) disables it. A bare filename is written next to the plugin DLL; an absolute path is used as given. |
 | `State.UsePlay` | bool | Show a small play badge. `0` = off, `1` = on. |
 | `State.PlayImage` | string | Image used for the play badge (a bundled asset name or a URL). |
+| `State.PlayText` | string | Tooltip text for the play badge. Default: `Playing`. Omitted when shorter than two characters. |
 | `State.UsePause` | bool | Show a small pause badge. `0` = off, `1` = on. |
 | `State.PauseImage` | string | Image used for the pause badge. |
+| `State.PauseText` | string | Tooltip text for the pause badge. Default: `Paused`. Omitted when shorter than two characters. |
 | `State.UseRadio` | bool | Show the radio badge for URL streams. `0` = off, `1` = on. |
-| `State.RadioImage` | string | Image used for the radio badge. The radio badge also carries the text *"Listening to URL"*. |
+| `State.RadioImage` | string | Image used for the radio badge. |
+| `State.RadioText` | string | Tooltip text for the radio badge. Default: empty, which omits `small_text` in radio state. Omitted when shorter than two characters. |
+
+### Templates and encoding
+
+`Details`, `State`, `LargeText`, `Button1.Label`, `Button1.Url`,
+`Button2.Label` and `Button2.Url` accept these tokens:
+
+| Token | Substituted with |
+| --- | --- |
+| `{title}` | The track title tag. |
+| `{artist}` | The artist tag. Multi-value tags are normalised to a comma followed by one space (`Billie Eilish, Khalid`). |
+| `{album}` | The album tag. |
+| `{year}` | The year/date tag, verbatim. |
+| `{genre}` | The genre tag. |
+
+An unknown `{token}` survives verbatim, braces included. A lone `{` or `}` is
+literal text, and a tag that is empty expands to nothing.
+
+When a button **Url** template is expanded, the substituted tag values are
+percent-encoded as UTF-8: RFC 3986 unreserved bytes (`A-Z a-z 0-9 - . _ ~`) stay
+raw and everything else becomes an uppercase `%XX`, so a space is `%20` (never
+`+`). The literal template text is **not** encoded, so an already-encoded `%20`
+in the template survives unchanged. Button **labels** are never encoded.
 
 ### Example `Profile/AIMP.ini`
 
@@ -117,16 +158,33 @@ UseAlbumArtOnline=1
 CoverToken=
 CoverRepo=nathwn12/aimp-discord-presence-art
 
-; Member-list status text: 0 = app name / 1 = song title / 2 = artist. Default: 2
+; Member-list status text: 0 = app name / 1 = artist / 2 = track title. Default: 2
 StatusDisplayType=2
+
+; Card text templates. Tokens: {title} {artist} {album} {year} {genre}
+Details={title}
+State={artist}
+LargeText={album}
+
+; Link buttons. Url token values are percent-encoded; labels are not.
+Button1.Label=Listen on Spotify
+Button1.Url=https://open.spotify.com/search/{title}
+Button2.Label=Find on YouTube
+Button2.Url=https://music.youtube.com/search?q={title}
+
+; Minimum milliseconds between updates; 0 disables the limit. Default: 4000
+ThrottleMs=4000
 
 ; Small status badges.
 State.UsePlay=0          ; Show the play badge. Default: 0
 State.PlayImage=aimp_play ; Image for the play badge
+State.PlayText=Playing   ; Tooltip for the play badge
 State.UsePause=0         ; Show the pause badge. Default: 0
 State.PauseImage=aimp_pause ; Image for the pause badge
+State.PauseText=Paused   ; Tooltip for the pause badge
 State.UseRadio=1         ; Show the radio badge for URL streams. Default: 1
 State.RadioImage=aimp_radio ; Image for the radio badge
+State.RadioText=         ; Tooltip for the radio badge; empty omits it
 ```
 
 ## Troubleshooting

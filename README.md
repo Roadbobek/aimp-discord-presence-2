@@ -48,16 +48,16 @@ to black. Every key, including `CoverToken` and `CoverRepo`, is documented in
 - The *Listening* activity type, so Discord says "Listening to AIMP".
 - Optional elapsed or remaining time. Timestamps are absolute, so Discord counts
   them down client-side, and presence is only sent when something changes.
-- Small play, pause and radio badges, each configurable. The radio badge carries
-  the text "Listening to URL".
+- Small play, pause and radio badges, each configurable. Each badge's text is a
+  configurable template; the radio badge's text is omitted by default.
 - Reconnection if Discord restarts, with updates coalesced to stay inside
   Discord's rate limit. The plugin never launches Discord for you.
 - Configuration through a plain ini file, so there is no settings window to
   click through. Every key is listed in [docs/BUILDING.md](docs/BUILDING.md).
 
 No line repeats a value already shown on another line, so a self-titled track
-cannot print the same text twice, and the default configuration shows the artist
-in the member-list status line.
+cannot print the same text twice, and the default configuration shows the track
+title in the member-list status line.
 
 ## Install
 

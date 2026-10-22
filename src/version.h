@@ -22,7 +22,7 @@
 #define AIMPDISCORDPRESENCE_SRC_VERSION_H_
 
 #define PL_MANUAL_MAJOR         2
-#define PL_MANUAL_MINOR         0
+#define PL_MANUAL_MINOR         1
 #define PL_MANUAL_RELEASE       0
 #define PL_MANUAL_BUILD         0
 

@@ -69,6 +69,10 @@ namespace DiscordIpc {
 constexpr size_t kTextFieldMinLength = 2;
 constexpr size_t kTextFieldMaxLength = 128;
 constexpr size_t kImageFieldMaxLength = 300;
+constexpr size_t kActivityNameMaxLength = 128;
+constexpr size_t kButtonLabelMaxLength = 32;
+constexpr size_t kButtonUrlMaxLength = 512;
+constexpr size_t kMaxActivityButtons = 2;
 
 // Opcodes of the local IPC protocol.
 constexpr uint32_t kOpcodeHandshake = 0;
@@ -109,6 +113,13 @@ enum class StatusDisplayType : int {
   kDetails = 2,
 };
 
+// One link button of the activity card. A button is present when its url is
+// non-empty; only https:// urls are emitted (Discord rejects anything else).
+struct ActivityButton {
+  std::string label;
+  std::string url;
+};
+
 struct Activity {
   int type = static_cast<int>(ActivityType::kListening);
   std::string details;  // track title
@@ -117,6 +128,10 @@ struct Activity {
   std::string large_text;
   std::string small_image;
   std::string small_text;
+  // Application name shown above the activity ("Listening to <name>").
+  std::string name;
+  // Up to two buttons; a slot with an empty url is skipped by the builder.
+  ActivityButton buttons[kMaxActivityButtons];
   int64_t start_timestamp = 0;  // unix seconds, 0 omits the field
   int64_t end_timestamp = 0;    // unix seconds, 0 omits the field
   int status_display_type = static_cast<int>(StatusDisplayType::kDetails);

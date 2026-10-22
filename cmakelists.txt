@@ -16,3 +16,17 @@ set( SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src )
 add_compile_options( /W4 /WX )
 
 add_subdirectory( ${SRC_DIR} )
+
+# --- Unit tests -------------------------------------------------------------
+#
+# Offline tests for the pure Discord payload builders. The test binary compiles
+# src/discord_ipc.cpp directly, so there is one implementation and no mock.
+# No third-party framework and no network are involved.
+enable_testing()
+
+add_executable( payload_tests
+  tests/payload_tests.cpp
+  ${SRC_DIR}/discord_ipc.cpp
+)
+target_include_directories( payload_tests PRIVATE ${SRC_DIR} )
+add_test( NAME payload_tests COMMAND payload_tests )
