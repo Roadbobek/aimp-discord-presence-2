@@ -160,6 +160,21 @@ std::string ResolveCoverCachePath(const std::wstring& configured) {
                                                         : configured);
 }
 
+// The Drive refresh token lives in a sidecar in the same directory as the cover
+// cache (drive-token.txt), so the whole publish chain's state sits together. An
+// empty cache path leaves the sidecar path empty, which turns the Drive host off
+// rather than writing a token somewhere unpredictable.
+std::string ResolveCoverStatePath(const std::string& cover_cache_path) {
+  if (cover_cache_path.empty()) {
+    return std::string();
+  }
+  const size_t separator = cover_cache_path.find_last_of("\\/");
+  if (separator == std::string::npos) {
+    return std::string();
+  }
+  return cover_cache_path.substr(0, separator + 1) + "drive-token.txt";
+}
+
 }  // namespace
 
 __declspec(dllexport) HRESULT WINAPI AIMPPluginGetHeader(void** Header) {
@@ -204,17 +219,33 @@ bool AimpDiscordPresence::Load() {
   // Publish target for local covers: the cache is keyed by image SHA-256, so a
   // cover is uploaded once and reused. Configuring it never touches the
   // network; an unusable path only costs the on-disk cache.
-  CoverPublisher::Configure(ResolveCoverCachePath(settings.cover_cache));
+  const std::string cover_cache_path = ResolveCoverCachePath(settings.cover_cache);
+  CoverPublisher::Configure(cover_cache_path);
+  // The preferred host chain: "auto" leads with Drive when its credentials are
+  // configured, otherwise GitHub. A typo in CoverHost is read as "auto", so the
+  // chain is never left empty.
+  CoverPublisher::ConfigureHost(Utils::ToString(settings.cover_host));
   // The permanent GitHub host. The token is handed to the publisher and lives
   // only in memory from here on: it is never logged, never written into the
   // cache, and sent only to api.github.com. An empty token simply leaves the
   // GitHub host out of the list, so the chain behaves as it did before.
   CoverPublisher::ConfigureAuth(Utils::ToString(settings.cover_token),
                                 Utils::ToString(settings.cover_repo));
+  // The Google Drive host. The client secret stays in memory, and the refresh
+  // token goes to drive-token.txt next to the cover cache. The first publish
+  // that reaches Drive opens the browser for a one-time consent on the cover
+  // worker thread; every failure falls through to the next host.
+  CoverPublisher::ConfigureDrive(Utils::ToString(settings.drive_client_id),
+                                 Utils::ToString(settings.drive_client_secret),
+                                 ResolveCoverStatePath(cover_cache_path));
   // Route the publisher's host-choice and all-hosts-failed lines into the same
   // DebugLog as the cover vocabulary.
   g_publisher_log_target = this;
   CoverPublisher::SetLogger(&PublisherLogTrampoline);
+  // One line per load, after the logger is live: the policy and which hosts are
+  // in the chain, with a fixed reason token for any that are not. This is what
+  // makes "no drive lines at all" diagnosable from the log itself.
+  CoverPublisher::LogHostConfiguration();
 
   // Single publisher worker. It owns no AIMP object, only the bytes it is
   // handed, and it is joined in Unload().
@@ -252,6 +283,9 @@ void AimpDiscordPresence::LoadConfig() {
   LoadConfigValue(config, L"DiscordPresence\\CoverCache", &settings.cover_cache);
   LoadConfigValue(config, L"DiscordPresence\\CoverToken", &settings.cover_token);
   LoadConfigValue(config, L"DiscordPresence\\CoverRepo", &settings.cover_repo);
+  LoadConfigValue(config, L"DiscordPresence\\CoverHost", &settings.cover_host);
+  LoadConfigValue(config, L"DiscordPresence\\DriveClientId", &settings.drive_client_id);
+  LoadConfigValue(config, L"DiscordPresence\\DriveClientSecret", &settings.drive_client_secret);
   LoadConfigValue(config, L"DiscordPresence\\StatusDisplayType", &settings.status_display_type);
   LoadConfigValue(config, L"DiscordPresence\\Name", &settings.name);
   LoadConfigValue(config, L"DiscordPresence\\Details", &settings.details_template);
@@ -317,7 +351,9 @@ bool AimpDiscordPresence::Unload() {
   g_publisher_log_target = nullptr;
 
   // Joins the publisher worker: it holds only queued image bytes, so it can be
-  // stopped without an AIMP object ever crossing threads.
+  // stopped without an AIMP object ever crossing threads. An in-flight browser
+  // consent is abandoned first, so the join never waits out the consent window.
+  CoverPublisher::CancelDriveConsent();
   StopCoverWorker();
 
   // Joins the artwork worker, so no callback can touch this plugin afterwards.

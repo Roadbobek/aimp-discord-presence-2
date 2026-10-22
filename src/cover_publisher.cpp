@@ -20,36 +20,50 @@
 
 #include "cover_publisher.h"
 
+// winsock2.h must precede windows.h, which it would otherwise clash with.
+#include <winsock2.h>
 #include <windows.h>
+#include <shellapi.h>
 #include <wincodec.h>
 #include <winhttp.h>
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <map>
 #include <mutex>
 #include <random>
 #include <regex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "utils.h"
 
 // WIC and the COM stream plumbing it needs; declared here so the plugin and the
-// offline test binary link the same way without extra project wiring.
+// offline test binary link the same way without extra project wiring. ws2_32 is
+// the OAuth loopback listener; shell32 is ShellExecuteA, which opens the
+// consent page, so the standalone test build links it like the plugin does.
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "shell32.lib")
 
 namespace {
 
 using CoverPublisher::Result;
+
+// Defined with the logger sink further down; the Drive consent path logs before
+// that definition, so the declaration comes first.
+void EmitLog(const std::string& line);
 
 // --- Transport constants ----------------------------------------------------
 
@@ -71,6 +85,33 @@ constexpr long long kNegativeCacheTtlSeconds = 60;
 // matching the live measurement of the host's request framing.
 constexpr size_t kBoundaryLength = 29;
 
+// --- Google Drive host constants --------------------------------------------
+//
+// The consent wait is the one long wait in the module. It is interactive, so it
+// cannot share the 6 s transport budget, but it runs on the cover worker only:
+// AIMP's message thread is never held, and CancelDriveConsent() lets an unload
+// end the wait immediately instead of joining a sleeping thread.
+constexpr DWORD kDriveConsentWindowMs = 120 * 1000;
+constexpr DWORD kDriveConsentPollMs = 250;
+// Per-receive budget on an accepted loopback socket. A client that connects and
+// sends nothing costs at most this much, and the consent deadline is checked
+// again before the next receive, so the wait can never outlive the window.
+constexpr DWORD kDriveReceiveTimeoutMs = 2000;
+// After an abandoned or declined consent, do not open a browser again for this
+// long. Without it every new track would pop a browser, because the negative
+// cache is keyed per image.
+constexpr DWORD kDriveConsentCooldownMs = 10 * 60 * 1000;
+// An access token is refreshed this many seconds before its stated expiry.
+constexpr long long kDriveAccessTokenSkewSeconds = 60;
+constexpr size_t kMaxDriveResponseBytes = 64 * 1024;
+constexpr size_t kMaxLoopbackRequestBytes = 8 * 1024;
+constexpr char kDriveFolderName[] = "aimp-covers";
+constexpr char kDriveAuthEndpoint[] = "https://accounts.google.com/o/oauth2/v2/auth";
+constexpr char kDriveScope[] = "https://www.googleapis.com/auth/drive.file";
+// Discord renders this lh3 short link as presence art (verified live); the id
+// is the Drive file id returned by the upload.
+constexpr char kDriveLh3UrlPrefix[] = "https://lh3.googleusercontent.com/d/";
+
 // Cover transfer shaping: the image is centre-cropped to a square (the shorter
 // side) and then scaled down to at most 512 px - Discord re-crops every large
 // image to a centre square anyway, so cropping here keeps the payload small and
@@ -88,14 +129,20 @@ constexpr size_t kMaxGitHubResponseBytes = 1024 * 1024;
 
 constexpr wchar_t kAgentName[] = L"AIMP-Discord-Presence/2.0";
 
-// Upload hosts are tried in order until one returns a usable URL. GitHub, when
-// a token is configured, is FIRST because it is the owner's own permanent repo;
-// catbox.moe is a permanent keyless host; uguu.se is the host measured working
-// from this network; litter.catbox.moe is kept LAST as a dormant fallback - it
-// answers HTTP 403 to a BunkerWeb WAF here, so it is never reached when an
-// earlier host succeeds, but it may still serve other networks. A host that
-// fails costs its round trip only, and never skips a layer of the cover chain.
-// Each host owns both its endpoint and the shape of its request body.
+// Upload hosts are tried in order until one returns a usable URL, and the chain
+// is policy-driven (CoverHost): "auto" - the default - leads with Drive when
+// its credentials exist, otherwise GitHub when a token and repo exist, and
+// otherwise starts keyless; "drive" and "github" pin that authenticated host.
+// The keyless hosts are appended in every case, in this order: catbox.moe,
+// then uguu.se, then the dormant litter.catbox.moe - last, because it answers
+// HTTP 403 to a BunkerWeb WAF here, so it is never reached when an earlier host
+// succeeds, though it may still serve other networks. A pinned host that is
+// not configured, or one that fails, costs its round trip only and leaves the
+// keyless fallbacks; it never skips a layer of the cover chain. Each host owns
+// both its endpoint and the shape of its request body.
+// A cached keyless URL is ephemeral: a hit on one is revalidated, or upgraded
+// to a permanent host when the policy names one. A permanent URL (Drive,
+// GitHub) is reused as-is.
 enum class UploadShape {
   // GitHub: PUT /repos/{owner}/{repo}/contents/covers/{name}.jpg with a JSON
   // body (base64 image). The response is JSON; the URL is content.download_url.
@@ -109,6 +156,10 @@ enum class UploadShape {
   // litterbox: POST /resources/internals/api.php with reqtype=fileupload,
   // time=72h and the image in `fileToUpload`.
   kLitterbox,
+  // Drive: POST /upload/drive/v3/files with a multipart/related body (a JSON
+  // metadata part, then the bytes) and a bearer token. The response is JSON;
+  // the URL is built from the file id.
+  kDrive,
 };
 
 struct UploadHost {
@@ -146,6 +197,20 @@ std::string g_github_token;
 std::wstring g_github_owner;
 std::wstring g_github_repo;
 
+// The Drive host configuration. `client_secret` is only ever sent to
+// oauth2.googleapis.com, in the token request body; it is never logged,
+// cached, or put into a Result. `state_path` is the sidecar that holds the
+// refresh token and the bootstrap folder id.
+std::string g_drive_client_id;
+std::string g_drive_client_secret;
+std::string g_drive_state_path;
+
+// The preferred host, from CoverHost. "auto" is the default; the keyless hosts
+// are always the last resort, whatever the preference.
+enum class CoverHostPolicy { kAuto, kDrive, kGithub, kKeyless };
+
+CoverHostPolicy g_cover_host = CoverHostPolicy::kAuto;
+
 // Splits "owner/name" into its two parts. A malformed value yields false, which
 // skips the GitHub host rather than building a nonsense request target.
 bool ParseOwnerRepo(const std::wstring& repo, std::wstring* owner, std::wstring* name) {
@@ -158,12 +223,197 @@ bool ParseOwnerRepo(const std::wstring& repo, std::wstring* owner, std::wstring*
   return name->find(L'/') == std::wstring::npos;
 }
 
-// Every host to try, in order. GitHub first only when a token and a parseable
-// repo are configured; the keyless hosts otherwise (unchanged chain).
+// "auto", "drive", "github" or "keyless", case-insensitive and trimmed; every
+// other value - including empty - is "auto", so a typo in AIMP.ini can never
+// leave the chain empty.
+CoverHostPolicy ParseCoverHostPolicy(const std::string& value) {
+  static const char kWhitespace[] = " \t\r\n";
+  size_t begin = 0;
+  size_t end = value.size();
+  while (begin < end && std::strchr(kWhitespace, value[begin]) != nullptr) {
+    ++begin;
+  }
+  while (end > begin && std::strchr(kWhitespace, value[end - 1]) != nullptr) {
+    --end;
+  }
+  std::string lower;
+  lower.reserve(end - begin);
+  for (size_t i = begin; i < end; ++i) {
+    const char c = value[i];
+    lower.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c);
+  }
+  if (lower == "drive") {
+    return CoverHostPolicy::kDrive;
+  }
+  if (lower == "github") {
+    return CoverHostPolicy::kGithub;
+  }
+  if (lower == "keyless") {
+    return CoverHostPolicy::kKeyless;
+  }
+  return CoverHostPolicy::kAuto;
+}
+
+// Which of the two authenticated hosts a publish leads with. Pure, so the
+// selection matrix is testable without credentials or a network:
+//   auto     drive when available, otherwise github when available
+//   drive    drive when available
+//   github   github when available
+//   keyless  neither - the anonymous hosts only
+// The keyless hosts are appended by ActiveHosts() in every case, so a failed
+// preferred host still falls through exactly as the chain always did.
+struct HostChainPlan {
+  bool drive = false;
+  bool github = false;
+};
+
+HostChainPlan PlanHostChain(CoverHostPolicy policy, bool drive_available, bool github_available) {
+  HostChainPlan plan;
+  switch (policy) {
+    case CoverHostPolicy::kDrive:
+      plan.drive = drive_available;
+      break;
+    case CoverHostPolicy::kGithub:
+      plan.github = github_available;
+      break;
+    case CoverHostPolicy::kKeyless:
+      break;
+    case CoverHostPolicy::kAuto:
+    default:
+      plan.drive = drive_available;
+      plan.github = !drive_available && github_available;
+      break;
+  }
+  return plan;
+}
+
+// The permanent hosts a cache upgrade may re-publish to, in the order the chain
+// tries them. Derived from the same HostChainPlan as a fresh upload, so the
+// cache path can never bypass the configured policy: with CoverHost=keyless the
+// list is empty and no authenticated host is ever touched, and with auto + Drive
+// credentials Drive comes first. Keyless hosts are never upgrade targets - an
+// ephemeral URL is exactly what an upgrade exists to replace.
+enum class PermanentHost { kDrive, kGitHub };
+
+std::vector<PermanentHost> PlanCacheUpgrade(CoverHostPolicy policy, bool drive_available,
+                                           bool github_available) {
+  const HostChainPlan plan = PlanHostChain(policy, drive_available, github_available);
+  std::vector<PermanentHost> hosts;
+  if (plan.drive) {
+    hosts.push_back(PermanentHost::kDrive);
+  }
+  if (plan.github) {
+    hosts.push_back(PermanentHost::kGitHub);
+  }
+  return hosts;
+}
+
+// The policy's own name, for the startup line and the cache logs.
+std::string PolicyName(CoverHostPolicy policy) {
+  switch (policy) {
+    case CoverHostPolicy::kDrive:
+      return "drive";
+    case CoverHostPolicy::kGithub:
+      return "github";
+    case CoverHostPolicy::kKeyless:
+      return "keyless";
+    case CoverHostPolicy::kAuto:
+    default:
+      return "auto";
+  }
+}
+
+// Why a host cannot be used, as a fixed token built from booleans only. No
+// configured value - not even a prefix or a length - can reach the log through
+// this path.
+std::string DriveUnavailableReason(bool client_id, bool client_secret, bool state_path) {
+  if (!client_id && !client_secret) {
+    return "no-credentials";
+  }
+  if (!client_id) {
+    return "no-client-id";
+  }
+  if (!client_secret) {
+    return "no-client-secret";
+  }
+  if (!state_path) {
+    return "no-state-path";
+  }
+  return std::string();
+}
+
+std::string GitHubUnavailableReason(bool token, bool repo) {
+  if (!token) {
+    return "no-token";
+  }
+  if (!repo) {
+    return "bad-repo";
+  }
+  return std::string();
+}
+
+// Everything the startup line needs, all of it booleans and fixed tokens.
+struct HostConfigSummary {
+  CoverHostPolicy policy = CoverHostPolicy::kAuto;
+  bool drive_usable = false;
+  bool github_usable = false;
+  std::string drive_reason;   // why Drive is unusable; empty when usable
+  std::string github_reason;  // why GitHub is unusable; empty when usable
+};
+
+// One line naming the policy and each host's participation: "on" means the host
+// is in the chain for this load, with the reason when it is not. Pure, so the
+// diagnostic line itself is pinned by a test.
+std::string FormatHostConfigLine(const HostConfigSummary& summary) {
+  const HostChainPlan plan =
+      PlanHostChain(summary.policy, summary.drive_usable, summary.github_usable);
+  std::string line = std::string("local-cover hosts policy=") + PolicyName(summary.policy);
+  line += std::string(" drive=") + (plan.drive ? "on" : "off");
+  if (!plan.drive) {
+    const std::string drive_reason =
+        summary.drive_usable ? std::string("policy") : summary.drive_reason;
+    if (!drive_reason.empty()) {
+      line += " drive-reason=" + drive_reason;
+    }
+  }
+  line += std::string(" github=") + (plan.github ? "on" : "off");
+  if (!plan.github) {
+    const std::string github_reason =
+        summary.github_usable ? std::string("policy") : summary.github_reason;
+    if (!github_reason.empty()) {
+      line += " github-reason=" + github_reason;
+    }
+  }
+  line += " keyless=on";
+  return line;
+}
+
+// A Drive host needs both OAuth values and a writable sidecar path: without the
+// sidecar the refresh token could not survive a restart, so the host is off.
+bool DriveConfiguredLocked() {
+  return !g_drive_client_id.empty() && !g_drive_client_secret.empty() && !g_drive_state_path.empty();
+}
+
+bool GitHubConfiguredLocked() {
+  return !g_github_token.empty() && !g_github_owner.empty() && !g_github_repo.empty();
+}
+
+// Every host to try, in order: the preferred authenticated host (Drive and/or
+// GitHub per the policy), then the keyless hosts, unchanged.
 std::vector<UploadHost> ActiveHosts() {
   std::lock_guard<std::mutex> lock(g_host_mutex);
+  const HostChainPlan plan =
+      PlanHostChain(g_cover_host, DriveConfiguredLocked(), GitHubConfiguredLocked());
   std::vector<UploadHost> hosts;
-  if (!g_github_token.empty() && !g_github_owner.empty() && !g_github_repo.empty()) {
+  if (plan.drive) {
+    UploadHost drive;
+    drive.name = L"drive.google.com";
+    drive.host = L"www.googleapis.com";
+    drive.path = L"/upload/drive/v3/files?uploadType=multipart&fields=id";
+    drive.shape = UploadShape::kDrive;
+    hosts.push_back(drive);
+  }
+  if (plan.github) {
     UploadHost github;
     github.name = L"github.com";
     github.host = L"api.github.com";
@@ -190,6 +440,13 @@ bool GitHubUploadActive() {
   return !g_github_token.empty() && !g_github_owner.empty() && !g_github_repo.empty();
 }
 
+// The Drive host is active only when the policy selects it AND its credentials
+// and sidecar are configured - the same condition ActiveHosts() uses.
+bool DriveUploadActive() {
+  std::lock_guard<std::mutex> lock(g_host_mutex);
+  return PlanHostChain(g_cover_host, DriveConfiguredLocked(), GitHubConfiguredLocked()).drive;
+}
+
 // Each host owns the exact URL shape it answers with, so a lookalike host
 // ("...moe.evil.test") or a body that is not that host's URL is rejected. The
 // success response is a bare https URL matching the host that answered; a WAF
@@ -204,6 +461,10 @@ constexpr char kCatboxUrlPattern[] = R"(^https://files\.catbox\.moe/[A-Za-z0-9]+
 // stored URL; the per-request classifier pins the exact owner and repo.
 constexpr char kGitHubRawUrlPattern[] =
     R"(^https://raw\.githubusercontent\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/main/covers/[0-9a-f]{64}\.jpg$)";
+// A Drive cover URL: the lh3 short link Discord renders. Pinned to the host, so
+// a lookalike can never be adopted as a cover.
+constexpr char kDriveLh3UrlPattern[] =
+    R"(^https://lh3\.googleusercontent\.com/d/[A-Za-z0-9_-]{10,}$)";
 // Fallback when no host is specified (kept for callers that classify a bare
 // response): the strict litterbox shape.
 std::string UploadUrlPatternFor(const UploadHost& upload_host) {
@@ -214,6 +475,8 @@ std::string UploadUrlPatternFor(const UploadHost& upload_host) {
       return std::string(kUguuUrlPattern);
     case UploadShape::kGitHub:
       return std::string(kGitHubRawUrlPattern);
+    case UploadShape::kDrive:
+      return std::string(kDriveLh3UrlPattern);
     case UploadShape::kLitterbox:
     default:
       return std::string(kLitterboxUrlPattern);
@@ -245,8 +508,10 @@ bool LooksLikeUploadUrl(const std::string& text) {
   static const std::regex uguu_pattern(kUguuUrlPattern);
   static const std::regex catbox_pattern(kCatboxUrlPattern);
   static const std::regex github_pattern(kGitHubRawUrlPattern);
+  static const std::regex drive_pattern(kDriveLh3UrlPattern);
   return std::regex_match(text, litterbox_pattern) || std::regex_match(text, uguu_pattern) ||
-         std::regex_match(text, catbox_pattern) || std::regex_match(text, github_pattern);
+         std::regex_match(text, catbox_pattern) || std::regex_match(text, github_pattern) ||
+         std::regex_match(text, drive_pattern);
 }
 
 // The per-host predicate used by the classifier: a 200 is a success only when
@@ -260,9 +525,32 @@ bool LooksLikeHostUrl(const std::string& text, const UploadHost& upload_host) {
       {kUguuUrlPattern, std::regex(kUguuUrlPattern)},
       {kCatboxUrlPattern, std::regex(kCatboxUrlPattern)},
       {kGitHubRawUrlPattern, std::regex(kGitHubRawUrlPattern)},
+      {kDriveLh3UrlPattern, std::regex(kDriveLh3UrlPattern)},
   };
   const auto found = patterns.find(url_pattern);
   return found != patterns.end() && std::regex_match(text, found->second);
+}
+
+// The host that owns a URL, as its log marker, or empty when the shape is not
+// one of the known hosts. Pure, so a cache hit can name its host with no
+// network and no upload: a stored URL's host is the host that served it.
+std::string HostNameForUrl(const std::string& url) {
+  if (LooksLikeHostUrl(url, UploadHost{L"catbox.moe", L"", L"", UploadShape::kCatbox})) {
+    return "catbox.moe";
+  }
+  if (LooksLikeHostUrl(url, UploadHost{L"uguu.se", L"", L"", UploadShape::kUguu})) {
+    return "uguu.se";
+  }
+  if (LooksLikeHostUrl(url, UploadHost{L"litter.catbox.moe", L"", L"", UploadShape::kLitterbox})) {
+    return "litter.catbox.moe";
+  }
+  if (LooksLikeHostUrl(url, UploadHost{L"github.com", L"", L"", UploadShape::kGitHub})) {
+    return "github.com";
+  }
+  if (LooksLikeHostUrl(url, UploadHost{L"drive.google.com", L"", L"", UploadShape::kDrive})) {
+    return "drive.google.com";
+  }
+  return std::string();
 }
 
 // A cached URL on a keyless host (catbox, uguu, litterbox) is ephemeral: it
@@ -280,20 +568,29 @@ bool IsGitHubCachedUrl(const std::string& url) {
   return LooksLikeHostUrl(url, UploadHost{L"", L"", L"", UploadShape::kGitHub});
 }
 
-// What a cache hit needs: use it as-is, re-publish the local bytes to the
-// permanent GitHub host, or revalidate the stored URL before trusting it.
+// What a cache hit needs: use it as-is, re-publish the local bytes to a
+// permanent host, or revalidate the stored URL before trusting it.
 // Pure, so the policy is testable without a network.
 enum class CachedUrlAction {
-  kUse,             // durable (GitHub) or unknown shape: answer the hit
-  kUpgradeToGitHub,  // ephemeral URL, token configured: re-publish to GitHub
-  kRevalidate,       // ephemeral URL, no token: health-check, re-publish if dead
+  kUse,  // durable (GitHub, Drive) or unknown shape: answer the hit
+  // Ephemeral URL and the host policy selects a permanent authenticated host:
+  // re-publish there. The target is whichever host PlanCacheUpgrade names, in
+  // chain order - never the keyless hosts themselves.
+  kUpgradeToPermanent,
+  // The historical name for the same action, kept so existing callers and
+  // tests keep their meaning; the target is no longer necessarily GitHub.
+  kUpgradeToGitHub = kUpgradeToPermanent,
+  kRevalidate,  // ephemeral URL, no permanent host: health-check, re-publish if dead
 };
 
-CachedUrlAction PlanCachedUrl(const std::string& url, bool github_active) {
+// A hit on an ephemeral keyless URL is never trusted blindly. `permanent_active`
+// is PlanCacheUpgrade(...).empty() negated: with a permanent host the bytes are
+// re-published there, without one the stored URL is revalidated.
+CachedUrlAction PlanCachedUrl(const std::string& url, bool permanent_active) {
   if (!IsEphemeralCachedUrl(url)) {
     return CachedUrlAction::kUse;
   }
-  return github_active ? CachedUrlAction::kUpgradeToGitHub : CachedUrlAction::kRevalidate;
+  return permanent_active ? CachedUrlAction::kUpgradeToPermanent : CachedUrlAction::kRevalidate;
 }
 
 std::string SanitizeMime(const char* mime) {
@@ -372,6 +669,41 @@ std::string BuildMultipartBody(const std::string& boundary, const std::string& m
     body.append(reinterpret_cast<const char*>(image.data()), image.size());
   }
   body += MultipartSuffix(boundary);
+  return body;
+}
+
+// --- Google Drive multipart/related body ------------------------------------
+//
+// Drive's upload endpoint takes a multipart/related body with exactly two
+// parts: a JSON metadata part (name + parent folder), then the raw bytes under
+// their real content type. Both parts share one boundary, and the request's own
+// Content-Type is "multipart/related; boundary=<boundary>" - not form-data.
+// The name and folder id are both hash/id shapes, so no JSON escaping is needed.
+
+std::string DriveMultipartContentType(const std::string& boundary) {
+  return "multipart/related; boundary=" + boundary;
+}
+
+std::string BuildDriveMetadataPart(const std::string& name, const std::string& folder_id) {
+  return "{\"name\":\"" + name + "\",\"parents\":[\"" + folder_id + "\"]}";
+}
+
+std::string BuildDriveMultipartBody(const std::string& boundary, const std::string& name,
+                                    const std::string& folder_id, const std::string& mime,
+                                    const std::vector<unsigned char>& image) {
+  const std::string delimiter = "--" + boundary + "\r\n";
+  std::string body;
+  body += delimiter;
+  body += "Content-Type: application/json; charset=UTF-8\r\n\r\n";
+  body += BuildDriveMetadataPart(name, folder_id);
+  body += "\r\n";
+  body += delimiter;
+  body += "Content-Type: " + mime + "\r\n\r\n";
+  if (!image.empty()) {
+    body.append(reinterpret_cast<const char*>(image.data()), image.size());
+  }
+  body += "\r\n";
+  body += "--" + boundary + "--\r\n";
   return body;
 }
 
@@ -565,6 +897,161 @@ Result ClassifyGitHubResponse(DWORD status, const std::string& body, const std::
   return Failure("http-" + std::to_string(status));
 }
 
+// --- Google Drive API -------------------------------------------------------
+//
+// The Drive host is the owner's own storage. The file is named by the SHA-256
+// of the uploaded bytes, matching the GitHub host's convention and the cache
+// key, and lives in one bootstrap folder made publicly readable once; children
+// inherit that, so no per-file permission call is ever made. The bearer token
+// only ever reaches googleapis.com, in a request header or the token body.
+
+bool LooksLikeDriveFileId(const std::string& id) {
+  if (id.size() < 10 || id.size() > 200) {
+    return false;
+  }
+  for (char c : id) {
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-' ||
+          c == '_')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The URL Discord renders for a Drive file. Kept short (host + 2 + id) for the
+// presence payload's 300-character budget.
+std::string DriveLh3Url(const std::string& file_id) {
+  return std::string(kDriveLh3UrlPrefix) + file_id;
+}
+
+// reads a bare JSON number field (expires_in). 0 when absent or malformed.
+long long ExtractJsonNumberField(const std::string& json, const std::string& key) {
+  const size_t position = json.find("\"" + key + "\"");
+  if (position == std::string::npos) {
+    return 0;
+  }
+  size_t cursor = position + key.size() + 2;
+  while (cursor < json.size() &&
+         (json[cursor] == ' ' || json[cursor] == '\t' || json[cursor] == '\r' || json[cursor] == '\n')) {
+    ++cursor;
+  }
+  if (cursor >= json.size() || json[cursor] != ':') {
+    return 0;
+  }
+  ++cursor;
+  while (cursor < json.size() &&
+         (json[cursor] == ' ' || json[cursor] == '\t' || json[cursor] == '\r' || json[cursor] == '\n')) {
+    ++cursor;
+  }
+  long long value = 0;
+  bool any = false;
+  while (cursor < json.size() && json[cursor] >= '0' && json[cursor] <= '9') {
+    value = value * 10 + (json[cursor] - '0');
+    any = true;
+    ++cursor;
+  }
+  return any ? value : 0;
+}
+
+// The first file id in a list response (`{"files":[{"id":"..."}]}`), or the id
+// of a create response. Empty when the body carries no plausible id.
+std::string FirstDriveFileId(const std::string& json) {
+  const size_t files = json.find("\"files\"");
+  const std::string scope = files == std::string::npos ? json : json.substr(files);
+  const std::string id = ExtractJsonStringField(scope, "id");
+  return LooksLikeDriveFileId(id) ? id : std::string();
+}
+
+// Classifies the upload response: 200/201 with a plausible file id, else a
+// failure that names the stage. 403 is Drive's general refusal (quota, sharing
+// policy, disabled API); 401 is a rejected bearer token. The body is never
+// echoed, so nothing a response contains can leak into a log line.
+Result ClassifyDriveUpload(DWORD status, const std::string& body) {
+  if (status == 200 || status == 201) {
+    const std::string id = ExtractJsonStringField(TrimWhitespace(body), "id");
+    if (!LooksLikeDriveFileId(id)) {
+      return Failure("drive-http-" + std::to_string(status) + "-unexpected-body");
+    }
+    Result result;
+    result.ok = true;
+    result.url = DriveLh3Url(id);
+    return result;
+  }
+  if (status == 401 || status == 403) {
+    return Failure("drive-http-" + std::to_string(status));
+  }
+  if (status == 429) {
+    return Failure("drive-quota");
+  }
+  return Failure("drive-http-" + std::to_string(status));
+}
+
+// The folder lookup. Encoded once here so the request target is testable
+// without a network: name, mimeType and trashed are the three filters the API
+// needs, and only ids come back.
+std::string BuildDriveFolderQuery() {
+  const std::string query = "name='" + std::string(kDriveFolderName) +
+                            "' and mimeType='application/vnd.google-apps.folder' and trashed=false";
+  return "/drive/v3/files?q=" + Utils::UriEncode(query) +
+         "&spaces=drive&pageSize=10&fields=files(id)";
+}
+
+std::string BuildDriveFolderMetadata() {
+  return std::string("{\"name\":\"") + kDriveFolderName +
+         "\",\"mimeType\":\"application/vnd.google-apps.folder\"}";
+}
+
+// The public-read grant for the bootstrap folder: one call, once, and every
+// child inherits it.
+std::string BuildDrivePermissionMetadata() { return "{\"role\":\"reader\",\"type\":\"anyone\"}"; }
+
+// What a public-read grant on the bootstrap folder means. Only an explicit
+// already-exists answer counts as success: persisting the folder as bootstrapped
+// after a refusal would cache an unfetchable lh3 URL for every later cover.
+enum class DrivePermissionVerdict {
+  kGranted,        // 200/201: the grant was created now
+  kAlreadyShared,  // 409, or a 4xx (other than 400/403) whose body says it exists
+  kDenied,         // 403: the API refused to share (org policy, sharing disabled)
+  kRejected,       // 400 and every other status: a malformed request or a fault
+};
+
+// Case-insensitive search of the two wordings Drive has used for an existing
+// grant: the API error text ("The permission already exists for the file") and
+// the reason token ("alreadyExists"), plus the older "already shared".
+bool BodySaysPermissionExists(const std::string& body) {
+  std::string lower;
+  lower.reserve(body.size() < 4096 ? body.size() : 4096);
+  for (size_t i = 0; i < body.size() && lower.size() < 4096; ++i) {
+    const char c = body[i];
+    lower.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c);
+  }
+  return lower.find("already exists") != std::string::npos ||
+         lower.find("alreadyexists") != std::string::npos ||
+         lower.find("already shared") != std::string::npos;
+}
+
+// Pure, so the decision is testable without a network. A 400 is a malformed
+// request and a 403 is a refusal; neither is evidence that the folder is
+// readable, so neither is treated as "already shared" whatever the body says.
+DrivePermissionVerdict ClassifyDrivePermission(DWORD status, const std::string& body) {
+  if (status >= 200 && status < 300) {
+    return DrivePermissionVerdict::kGranted;
+  }
+  if (status == 400) {
+    return DrivePermissionVerdict::kRejected;
+  }
+  if (status == 403) {
+    return DrivePermissionVerdict::kDenied;
+  }
+  if (status == 409) {
+    return DrivePermissionVerdict::kAlreadyShared;
+  }
+  if (status >= 400 && status < 500 && BodySaysPermissionExists(body)) {
+    return DrivePermissionVerdict::kAlreadyShared;
+  }
+  return DrivePermissionVerdict::kRejected;
+}
+
 // --- SHA-256 (cache keys) ---------------------------------------------------
 
 constexpr uint32_t kSha256RoundConstants[64] = {
@@ -701,6 +1188,91 @@ std::string Sha256Hex(const std::vector<unsigned char>& bytes) {
     hex.push_back(kHex[byte & 0x0f]);
   }
   return hex;
+}
+
+// --- PKCE, OAuth state, and base64url --------------------------------------
+//
+// RFC 7636 S256: a 43-character base64url verifier (32 random bytes) and its
+// challenge, the base64url SHA-256 of the verifier. Neither value is secret in
+// the sense of a credential - the challenge travels in the browser URL and the
+// verifier only in the token POST - but both are unguessable.
+
+std::string Base64UrlEncode(const unsigned char* data, size_t length) {
+  static const char kAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  std::string encoded;
+  encoded.reserve((length * 4 + 2) / 3);
+  size_t i = 0;
+  while (i + 3 <= length && data != nullptr) {
+    const uint32_t chunk = (static_cast<uint32_t>(data[i]) << 16) |
+                           (static_cast<uint32_t>(data[i + 1]) << 8) |
+                           static_cast<uint32_t>(data[i + 2]);
+    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3f]);
+    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3f]);
+    encoded.push_back(kAlphabet[(chunk >> 6) & 0x3f]);
+    encoded.push_back(kAlphabet[chunk & 0x3f]);
+    i += 3;
+  }
+  const size_t remaining = length - i;
+  if (data != nullptr && remaining == 1) {
+    const uint32_t chunk = static_cast<uint32_t>(data[i]) << 16;
+    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3f]);
+    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3f]);
+  } else if (data != nullptr && remaining == 2) {
+    const uint32_t chunk =
+        (static_cast<uint32_t>(data[i]) << 16) | (static_cast<uint32_t>(data[i + 1]) << 8);
+    encoded.push_back(kAlphabet[(chunk >> 18) & 0x3f]);
+    encoded.push_back(kAlphabet[(chunk >> 12) & 0x3f]);
+    encoded.push_back(kAlphabet[(chunk >> 6) & 0x3f]);
+  }
+  return encoded;
+}
+
+// std::random_device is the system RNG on MSVC (rand_s), which is what a token
+// here needs; it is seeded per call, so no generator state is shared between
+// threads.
+std::string RandomToken(size_t byte_count) {
+  std::random_device source;
+  std::vector<unsigned char> bytes(byte_count);
+  for (size_t i = 0; i < byte_count; ++i) {
+    bytes[i] = static_cast<unsigned char>(source() & 0xffu);
+  }
+  return Base64UrlEncode(bytes.data(), bytes.size());
+}
+
+std::string PkceCodeVerifier() { return RandomToken(32); }
+
+std::string PkceCodeChallenge(const std::string& verifier) {
+  unsigned char digest[32] = {};
+  Sha256 hasher;
+  hasher.Update(reinterpret_cast<const unsigned char*>(verifier.data()), verifier.size());
+  hasher.Final(digest);
+  return Base64UrlEncode(digest, sizeof(digest));
+}
+
+std::string OAuthStateToken() { return RandomToken(16); }
+
+// The full consent URL. `client_secret` is deliberately not a parameter: it
+// must never reach a browser. The redirect is the loopback listener, and the
+// challenge, not the verifier, travels here.
+std::string BuildDriveAuthUrl(const std::string& client_id, const std::string& redirect_uri,
+                              const std::string& verifier, const std::string& state) {
+  std::string url = kDriveAuthEndpoint;
+  url += "?client_id=";
+  url += Utils::UriEncode(client_id);
+  url += "&redirect_uri=";
+  url += Utils::UriEncode(redirect_uri);
+  url += "&response_type=code";
+  url += "&scope=";
+  url += Utils::UriEncode(std::string(kDriveScope));
+  url += "&access_type=offline";
+  url += "&prompt=consent";
+  url += "&code_challenge=";
+  url += PkceCodeChallenge(verifier);
+  url += "&code_challenge_method=S256";
+  url += "&state=";
+  url += Utils::UriEncode(state);
+  return url;
 }
 
 // --- Image preparation (WIC) ------------------------------------------------
@@ -1139,6 +1711,10 @@ bool CacheLookup(const std::string& key, long long now, Result* out) {
   if (found->second.ok) {
     result.ok = true;
     result.url = found->second.payload;
+    // Name the host that served this URL, so a cache hit reports its real host
+    // ("catbox.moe", "litter.catbox.moe", ...) instead of an empty field the
+    // caller logs as "unknown".
+    result.host = HostNameForUrl(result.url);
   } else {
     result.reason = found->second.payload;
   }
@@ -1162,6 +1738,104 @@ void CacheStore(const std::string& key, const Result& result, long long now) {
   }
   g_cache[key] = entry;
   SaveCacheLocked();
+}
+
+// --- Drive sidecar (refresh token + bootstrap folder) -----------------------
+//
+// The sidecar is a tiny key=value text file. It holds the refresh token and the
+// bootstrap folder id and nothing else: no access token (in memory only), no
+// client secret, no image bytes, never a log line. The parser is strict so a
+// truncated, clobbered or foreign file reads as "not authorized" rather than as
+// a token that would be sent somewhere.
+
+struct DriveState {
+  std::string refresh_token;
+  std::string folder_id;
+};
+
+// Tokens are opaque but always printable and URL-safe. Anything with
+// whitespace, control characters, quotes or an absurd length is corrupt.
+bool IsDriveRefreshToken(const std::string& token) {
+  if (token.size() < 16 || token.size() > 2048) {
+    return false;
+  }
+  for (char c : token) {
+    if (c <= 0x20 || c >= 0x7f || c == '"' || c == '\\' || c == '\'') {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ParseDriveState(const std::string& content, DriveState* state) {
+  DriveState parsed;
+  size_t start = 0;
+  for (;;) {
+    const size_t end = content.find('\n', start);
+    std::string line =
+        end == std::string::npos ? content.substr(start) : content.substr(start, end - start);
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (!line.empty() && line[0] != '#') {
+      const size_t equals = line.find('=');
+      if (equals == std::string::npos || equals == 0) {
+        return false;  // a line that is not key=value: corrupt
+      }
+      const std::string key = line.substr(0, equals);
+      const std::string value = line.substr(equals + 1);
+      if (key == "refresh_token") {
+        parsed.refresh_token = value;
+      } else if (key == "folder_id") {
+        // The folder id is only a bootstrap cache: an unusable value is dropped
+        // (the next publish finds or creates the folder again) rather than
+        // throwing away a perfectly good refresh token.
+        parsed.folder_id = LooksLikeDriveFileId(value) ? value : std::string();
+      } else {
+        return false;  // an unknown key means this is not our file
+      }
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+  // A file without a usable refresh token is "not authorized", which is the
+  // same outcome as no file at all: run consent again on the next publish.
+  if (!IsDriveRefreshToken(parsed.refresh_token)) {
+    return false;
+  }
+  *state = parsed;
+  return true;
+}
+
+std::string FormatDriveState(const DriveState& state) {
+  std::string content = "# aimp-discord-presence drive state v1\n";
+  content += "refresh_token=" + state.refresh_token + "\n";
+  if (!state.folder_id.empty()) {
+    content += "folder_id=" + state.folder_id + "\n";
+  }
+  return content;
+}
+
+bool LoadDriveState(const std::string& path, DriveState* state) {
+  if (path.empty()) {
+    return false;
+  }
+  std::string content;
+  if (!ReadWholeFile(path, &content)) {
+    return false;
+  }
+  return ParseDriveState(content, state);
+}
+
+// Best effort: a sidecar that cannot be written only costs a repeat consent on
+// the next start, so it never fails the publish that just succeeded.
+bool SaveDriveState(const std::string& path, const DriveState& state) {
+  if (path.empty()) {
+    return false;
+  }
+  return WriteWholeFile(path, FormatDriveState(state));
 }
 
 // --- WinHTTP plumbing -------------------------------------------------------
@@ -1462,10 +2136,805 @@ UploadAttempt UploadGitHubBody(const std::wstring& owner, const std::wstring& re
   return AttemptResult(ClassifyGitHubResponse(status, response, owner, repo, name));
 }
 
+// --- Google Drive transport -------------------------------------------------
+//
+// Every request here is built and sent on the cover worker thread. Nothing in
+// this section runs on AIMP's message thread, and every wait is bounded: the
+// transport by kTotalTimeoutMs, the interactive consent by the consent window
+// (and by CancelDriveConsent at unload).
+
+struct DriveConfig {
+  std::string client_id;
+  std::string client_secret;
+  std::string state_path;
+};
+
+DriveConfig SnapshotDriveConfig() {
+  std::lock_guard<std::mutex> lock(g_host_mutex);
+  DriveConfig config;
+  config.client_id = g_drive_client_id;
+  config.client_secret = g_drive_client_secret;
+  config.state_path = g_drive_state_path;
+  return config;
+}
+
+bool DriveConfigured(const DriveConfig& config) {
+  return !config.client_id.empty() && !config.client_secret.empty() && !config.state_path.empty();
+}
+
+struct HttpResponse {
+  bool transport_ok = false;
+  DWORD status = 0;
+  std::string body;
+  std::string transport_reason;
+};
+
+// One HTTPS request with an explicit method, target, headers and body. Kept
+// separate from the form-data upload helpers so the working keyless chain and
+// the GitHub path are untouched by this host.
+HttpResponse SendHttp(const std::wstring& method, const std::wstring& host, const std::wstring& path,
+                      const std::wstring& headers, const std::string& body,
+                      size_t max_bytes = kMaxDriveResponseBytes) {
+  HttpResponse response;
+  if (body.size() > 0xffffffffull) {
+    response.transport_reason = "body-too-large";
+    return response;
+  }
+  const Deadline deadline(kTotalTimeoutMs);
+  WinHttpHandle session = OpenSession(deadline);
+  if (!session) {
+    response.transport_reason = TransportReason("session-open-failed", "connect", GetLastError());
+    return response;
+  }
+  WinHttpHandle connection(WinHttpConnect(session.get(), host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0));
+  if (!connection) {
+    response.transport_reason = TransportReason("connect-failed", "connect", GetLastError());
+    return response;
+  }
+  WinHttpHandle request(WinHttpOpenRequest(connection.get(), method.c_str(), path.c_str(), nullptr,
+                                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                           WINHTTP_FLAG_SECURE));
+  if (!request) {
+    response.transport_reason = TransportReason("request-open-failed", "send", GetLastError());
+    return response;
+  }
+  const DWORD body_size = static_cast<DWORD>(body.size());
+  if (WinHttpSendRequest(request.get(),
+                         headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
+                         headers.empty() ? 0 : static_cast<DWORD>(-1),
+                         body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(body.data()),
+                         body_size, body_size, 0) == FALSE) {
+    response.transport_reason = TransportReason("send-failed", "send", GetLastError());
+    return response;
+  }
+  if (WinHttpReceiveResponse(request.get(), nullptr) == FALSE) {
+    response.transport_reason = TransportReason("receive-failed", "receive", GetLastError());
+    return response;
+  }
+  DWORD status_error = 0;
+  if (!QueryStatusCode(request.get(), &response.status, &status_error)) {
+    // The host answered; the status is unreadable, so no retry (a retry could
+    // create a second file).
+    response.transport_ok = true;
+    response.status = 0;
+    response.transport_reason = "status-query-failed phase=receive winhttp=" +
+                                std::to_string(status_error);
+    return response;
+  }
+  const ReadOutcome read = ReadResponseBody(request.get(), deadline, &response.body, max_bytes);
+  if (!read.ok) {
+    response.transport_reason = TransportReason(read.tag, "receive", read.error);
+    return response;
+  }
+  response.transport_ok = true;
+  return response;
+}
+
+std::string FormEncode(const std::vector<std::pair<std::string, std::string>>& fields) {
+  std::string body;
+  for (const auto& field : fields) {
+    if (!body.empty()) {
+      body += "&";
+    }
+    body += Utils::UriEncode(field.first);
+    body += "=";
+    body += Utils::UriEncode(field.second);
+  }
+  return body;
+}
+
+// The token endpoint's answer. `refresh_token` is present only for an
+// authorization_code grant (and, defensively, if Google ever re-issues one).
+struct DriveTokenGrant {
+  std::string access_token;
+  std::string refresh_token;
+  long long expires_in = 3600;
+};
+
+bool ParseDriveTokenGrant(const std::string& body, DriveTokenGrant* grant) {
+  const std::string text = TrimWhitespace(body);
+  const std::string access = ExtractJsonStringField(text, "access_token");
+  if (access.empty()) {
+    return false;
+  }
+  DriveTokenGrant parsed;
+  parsed.access_token = access;
+  const std::string refresh = ExtractJsonStringField(text, "refresh_token");
+  if (!refresh.empty()) {
+    parsed.refresh_token = refresh;
+  }
+  const long long expires = ExtractJsonNumberField(text, "expires_in");
+  if (expires > 0) {
+    parsed.expires_in = expires;
+  }
+  *grant = parsed;
+  return true;
+}
+
+// Posts one grant to oauth2.googleapis.com. The client secret is in the form
+// body and nowhere else; a failure names only the status, never the body.
+bool PostDriveToken(const std::vector<std::pair<std::string, std::string>>& fields,
+                    DriveTokenGrant* grant, std::string* reason) {
+  const HttpResponse response =
+      SendHttp(L"POST", L"oauth2.googleapis.com", L"/token",
+               L"Content-Type: application/x-www-form-urlencoded\r\n", FormEncode(fields));
+  if (!response.transport_ok) {
+    *reason = response.transport_reason.empty() ? std::string("token-transport-failed")
+                                                : "token-" + response.transport_reason;
+    return false;
+  }
+  if (response.status != 200) {
+    *reason = "token-http-" + std::to_string(response.status);
+    return false;
+  }
+  if (!ParseDriveTokenGrant(response.body, grant)) {
+    *reason = "token-unexpected-body";
+    return false;
+  }
+  return true;
+}
+
+// The access token, refreshed or obtained by consent. Guarded together with the
+// cached access token: only the cover worker ever calls this, and the lock also
+// keeps a second concurrent publish (should one ever exist) from consenting
+// twice.
+std::mutex g_drive_session_mutex;
+std::string g_drive_access_token;
+long long g_drive_access_expires_at = 0;
+std::string g_drive_folder_id;
+
+// The consent wait's abort flag, set by CancelDriveConsent (plugin unload) and
+// cleared at the start of every consent. The cooldown timestamp stops an
+// abandoned or declined consent from popping a browser on every track.
+std::atomic<bool> g_drive_consent_cancel{false};
+std::atomic<long long> g_drive_consent_failed_at{0};
+
+// --- Loopback consent listener ----------------------------------------------
+
+bool EnsureWinsock(std::string* reason) {
+  static std::once_flag once;
+  static bool started = false;
+  std::call_once(once, []() {
+    WSADATA data = {};
+    started = WSAStartup(MAKEWORD(2, 2), &data) == 0;
+  });
+  if (!started) {
+    *reason = "consent-winsock-unavailable";
+  }
+  return started;
+}
+
+struct LoopbackParams {
+  std::string code;
+  std::string state;
+  std::string error;
+};
+
+std::string QueryParameter(const std::string& query, const std::string& key) {
+  size_t start = 0;
+  for (;;) {
+    const size_t end = query.find('&', start);
+    const std::string pair =
+        end == std::string::npos ? query.substr(start) : query.substr(start, end - start);
+    const size_t equals = pair.find('=');
+    const std::string name = equals == std::string::npos ? pair : pair.substr(0, equals);
+    if (name == key) {
+      return Utils::UriDecode(equals == std::string::npos ? std::string() : pair.substr(equals + 1));
+    }
+    if (end == std::string::npos) {
+      return std::string();
+    }
+    start = end + 1;
+  }
+}
+
+// The request target of a loopback callback, e.g. "/?state=abc&code=xyz".
+LoopbackParams ParseLoopbackTarget(const std::string& target) {
+  LoopbackParams params;
+  const size_t question = target.find('?');
+  if (question == std::string::npos) {
+    return params;
+  }
+  const std::string query = target.substr(question + 1);
+  params.code = QueryParameter(query, "code");
+  params.state = QueryParameter(query, "state");
+  params.error = QueryParameter(query, "error");
+  return params;
+}
+
+// The request target (the second token of the request line). Empty when the
+// request line is malformed.
+std::string RequestTarget(const std::string& request) {
+  const size_t line_end = request.find("\r\n");
+  const std::string line = line_end == std::string::npos ? request : request.substr(0, line_end);
+  const size_t first = line.find(' ');
+  if (first == std::string::npos) {
+    return std::string();
+  }
+  const size_t second = line.find(' ', first + 1);
+  if (second == std::string::npos) {
+    return std::string();
+  }
+  return line.substr(first + 1, second - first - 1);
+}
+
+std::string ConsentPage(const char* message) {
+  const std::string body =
+      std::string("<!doctype html><html><head><meta charset=\"utf-8\">"
+                  "<title>AIMP Discord Presence</title></head><body><p>") +
+      message + "</p></body></html>";
+  return "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " +
+         std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+}
+
+struct ConsentCallback {
+  bool ok = false;
+  std::string code;
+  std::string error;  // "cancelled", "timeout", "unexpected-request", or Google's error code
+};
+
+// --- Consent deadline arithmetic -------------------------------------------
+//
+// The whole consent operation (browser hand-off plus loopback wait) shares one
+// absolute deadline, and every blocking call is clamped to what remains. The
+// arithmetic is pure, so the hard bound is testable without a socket.
+
+long long NowMillis() {
+  return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+}
+
+// Milliseconds left before `deadline_ms`: 0 once it has passed, never negative,
+// so a caller can clamp a blocking call to it without an unsigned wraparound.
+long long RemainingMillis(long long deadline_ms, long long now_ms) {
+  return now_ms < deadline_ms ? deadline_ms - now_ms : 0;
+}
+
+// How long one blocking call may wait: the remaining budget capped at `cap_ms`,
+// and 0 when the deadline has already passed (the caller must not block at all).
+long long ReceiveSliceMillis(long long deadline_ms, long long now_ms, long long cap_ms) {
+  const long long remaining = RemainingMillis(deadline_ms, now_ms);
+  if (remaining <= 0 || cap_ms <= 0) {
+    return 0;
+  }
+  return remaining < cap_ms ? remaining : cap_ms;
+}
+
+// Accepts at most this many loopback connections: enough for a browser's silent
+// preconnect followed by the real callback, and a hard cap on everything else.
+constexpr size_t kDriveConsentMaxConnections = 2;
+
+// Closes its socket on every exit path, including an early return or an unwind.
+class SocketHandle {
+ public:
+  explicit SocketHandle(SOCKET socket = INVALID_SOCKET) : socket_(socket) {}
+  ~SocketHandle() { Reset(); }
+  SocketHandle(const SocketHandle&) = delete;
+  SocketHandle& operator=(const SocketHandle&) = delete;
+
+  SOCKET get() const { return socket_; }
+  bool valid() const { return socket_ != INVALID_SOCKET; }
+
+  void Reset(SOCKET socket = INVALID_SOCKET) {
+    if (socket_ != INVALID_SOCKET) {
+      closesocket(socket_);
+    }
+    socket_ = socket;
+  }
+
+ private:
+  SOCKET socket_;
+};
+
+// What the accept loop does next, decided from one select() result. Pure, so the
+// wait's bound is testable without sockets: a select() timeout (0) is only a
+// poll tick and must never end the wait - counting polls as connections is what
+// collapsed the window to two 250 ms slices - while a ready socket (> 0)
+// proceeds to accept. Only the cancel flag or the absolute deadline ends it.
+enum class ConsentStep { kKeepWaiting, kAccept, kCancelled, kExpired };
+
+ConsentStep DecideConsentStep(int select_result, bool cancelled, long long now_ms,
+                              long long deadline_ms) {
+  if (cancelled) {
+    return ConsentStep::kCancelled;
+  }
+  if (RemainingMillis(deadline_ms, now_ms) <= 0) {
+    return ConsentStep::kExpired;
+  }
+  return select_result > 0 ? ConsentStep::kAccept : ConsentStep::kKeepWaiting;
+}
+
+// The callback's error text is attacker-controllable: it arrives as a query
+// parameter, so it can carry newlines, quotes or anything else a crafted request
+// likes. It is never echoed - it is mapped onto a closed set of fixed tokens, and
+// everything else becomes "error".
+std::string ConsentErrorToken(const std::string& error) {
+  if (error == "access_denied") {
+    return "access_denied";
+  }
+  if (error == "invalid_scope") {
+    return "invalid_scope";
+  }
+  if (error == "invalid_request") {
+    return "invalid_request";
+  }
+  return "error";
+}
+
+// Accepts loopback connections until the matching reply arrives, the absolute
+// deadline passes, or the wait is cancelled. Every blocking call is bounded
+// twice - by SO_RCVTIMEO on the accepted socket and by a deadline check before
+// each receive - so a local client that connects and sends nothing, or sends a
+// byte at a time, can never extend the wait or hold the publisher worker join.
+// Only an actually accepted socket consumes the connection budget, so idle
+// polling never shortens the window. The listener is only ever accepted from
+// here, one connection at a time.
+ConsentCallback WaitForConsentCallback(SOCKET listener, const std::string& expected_state,
+                                       long long deadline_ms) {
+  ConsentCallback callback;
+  const std::string waiting_page = ConsentPage("Waiting for the authorization reply. Return to AIMP.");
+  size_t accepted = 0;
+  for (;;) {
+    if (accepted >= kDriveConsentMaxConnections) {
+      callback.error = "timeout";
+      return callback;
+    }
+    const long long wait_ms = ReceiveSliceMillis(deadline_ms, NowMillis(), kDriveConsentPollMs);
+    if (wait_ms <= 0) {
+      callback.error = "timeout";
+      return callback;
+    }
+    fd_set read_set;
+    FD_ZERO(&read_set);
+    FD_SET(listener, &read_set);
+    timeval slice = {};
+    slice.tv_sec = static_cast<long>(wait_ms / 1000);
+    slice.tv_usec = static_cast<long>((wait_ms % 1000) * 1000);
+    const int ready = select(0, &read_set, nullptr, nullptr, &slice);
+    const ConsentStep step =
+        DecideConsentStep(ready, g_drive_consent_cancel.load(), NowMillis(), deadline_ms);
+    if (step == ConsentStep::kKeepWaiting) {
+      if (ready < 0) {
+        Sleep(kDriveConsentPollMs);  // a select error must not spin the worker
+      }
+      continue;  // a poll tick or a spurious wakeup: nothing has been consumed
+    }
+    if (step == ConsentStep::kCancelled) {
+      callback.error = "cancelled";
+      return callback;
+    }
+    if (step == ConsentStep::kExpired) {
+      callback.error = "timeout";
+      return callback;
+    }
+    SocketHandle client(accept(listener, nullptr, nullptr));
+    if (!client.valid()) {
+      continue;  // the connection died before accept: no client was served
+    }
+    ++accepted;  // only a socket actually accepted consumes the budget
+
+    const long long receive_ms =
+        ReceiveSliceMillis(deadline_ms, NowMillis(), kDriveReceiveTimeoutMs);
+    if (receive_ms <= 0) {
+      callback.error = "timeout";
+      return callback;  // the client socket is closed by the guard
+    }
+    DWORD receive_timeout = static_cast<DWORD>(receive_ms);
+    setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&receive_timeout), sizeof(receive_timeout));
+
+    std::string request;
+    char buffer[1024];
+    for (;;) {
+      if (g_drive_consent_cancel.load()) {
+        callback.error = "cancelled";
+        return callback;
+      }
+      if (ReceiveSliceMillis(deadline_ms, NowMillis(), kDriveReceiveTimeoutMs) <= 0) {
+        callback.error = "timeout";
+        return callback;
+      }
+      const int received = recv(client.get(), buffer, static_cast<int>(sizeof(buffer)), 0);
+      if (received <= 0) {
+        break;  // closed, or the receive timeout fired: drop this connection
+      }
+      request.append(buffer, static_cast<size_t>(received));
+      if (request.find("\r\n\r\n") != std::string::npos ||
+          request.size() >= kMaxLoopbackRequestBytes) {
+        break;
+      }
+    }
+    if (g_drive_consent_cancel.load()) {
+      callback.error = "cancelled";
+      return callback;
+    }
+    if (request.find("\r\n\r\n") == std::string::npos) {
+      continue;  // a silent preconnect or a truncated request: drop it, keep waiting
+    }
+
+    const LoopbackParams params = ParseLoopbackTarget(RequestTarget(request));
+    const bool answers_this_consent =
+        params.state == expected_state && (!params.code.empty() || !params.error.empty());
+    const std::string page =
+        answers_this_consent
+            ? ConsentPage(params.error.empty()
+                              ? "Google Drive is connected. You can close this tab."
+                              : "Authorization was not granted. You can close this tab.")
+            : waiting_page;
+    send(client.get(), page.data(), static_cast<int>(page.size()), 0);
+    client.Reset();  // close before answering, so the browser's page is complete
+
+    if (answers_this_consent) {
+      callback.ok = params.error.empty();
+      callback.code = params.code;
+      // The raw callback text never leaves this function: only a fixed token.
+      callback.error =
+          params.error.empty() ? std::string() : ConsentErrorToken(params.error);
+      return callback;
+    }
+    // One request has been handled: stop listening rather than serve further
+    // connections. A reply that is not ours cannot complete this consent.
+    callback.error = "unexpected-request";
+    return callback;
+  }
+}
+
+// The one interactive step: browser, loopback, PKCE, then persist the refresh
+// token. Returns false with a reason on every failure, so the caller falls
+// through to the next host instead of throwing or hanging.
+bool RunDriveConsent(const DriveConfig& config, DriveState* state, std::string* reason) {
+  // One absolute deadline for the whole operation: socket setup, the browser
+  // hand-off, the loopback wait and the token exchange all draw from it, so no
+  // client behaviour can extend it.
+  const long long consent_deadline_ms = NowMillis() + static_cast<long long>(kDriveConsentWindowMs);
+  std::string winsock_reason;
+  if (!EnsureWinsock(&winsock_reason)) {
+    *reason = winsock_reason;
+    return false;
+  }
+  // No reset here: the cancel flag is set once, by unload, and must stay set so
+  // a consent that starts after the unload began cannot hold the worker join
+  // open. ConfigureDrive clears it at load.
+  if (g_drive_consent_cancel.load()) {
+    *reason = "consent-cancelled";
+    return false;
+  }
+
+  SocketHandle listener(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+  if (!listener.valid()) {
+    *reason = "consent-socket-failed";
+    return false;
+  }
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = 0;  // ephemeral port, chosen by the OS
+  bool listening =
+      bind(listener.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0 &&
+      listen(listener.get(), 1) == 0;
+  unsigned short port = 0;
+  if (listening) {
+    sockaddr_in bound = {};
+    int bound_length = static_cast<int>(sizeof(bound));
+    if (getsockname(listener.get(), reinterpret_cast<sockaddr*>(&bound), &bound_length) == 0) {
+      port = ntohs(bound.sin_port);
+    }
+    listening = port != 0;
+  }
+  if (!listening) {
+    *reason = "consent-listen-failed";
+    return false;  // the socket is closed by the guard
+  }
+
+  const std::string redirect_uri = "http://127.0.0.1:" + std::to_string(port) + "/";
+  const std::string verifier = PkceCodeVerifier();
+  const std::string oauth_state = OAuthStateToken();
+  const std::string auth_url = BuildDriveAuthUrl(config.client_id, redirect_uri, verifier, oauth_state);
+
+  // ShellExecuteA is what opens the default browser; a failure here is a real
+  // failure, not a transport one, so the chain moves on.
+  const HINSTANCE launched =
+      ShellExecuteA(nullptr, "open", auth_url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  if (reinterpret_cast<INT_PTR>(launched) <= 32) {
+    *reason = "consent-browser-open-failed";
+    return false;
+  }
+  EmitLog("local-cover drive auth=consent port=" + std::to_string(port));
+
+  const ConsentCallback callback =
+      WaitForConsentCallback(listener.get(), oauth_state, consent_deadline_ms);
+  listener.Reset();  // stop listening before the token exchange
+  if (!callback.ok) {
+    *reason = callback.error.empty() ? std::string("consent-failed") : "consent-" + callback.error;
+    EmitLog("local-cover drive auth=declined reason=" + *reason);
+    return false;
+  }
+  // The exchange still has to fit the same window. Requiring a full transport
+  // budget means the whole consent - wait plus exchange - can never exceed the
+  // window, even when the code arrives on its last second.
+  if (RemainingMillis(consent_deadline_ms, NowMillis()) <
+      static_cast<long long>(kTotalTimeoutMs)) {
+    *reason = "consent-timeout";
+    EmitLog("local-cover drive auth=declined reason=" + *reason);
+    return false;
+  }
+
+  std::vector<std::pair<std::string, std::string>> fields;
+  fields.emplace_back("code", callback.code);
+  fields.emplace_back("client_id", config.client_id);
+  fields.emplace_back("client_secret", config.client_secret);
+  fields.emplace_back("redirect_uri", redirect_uri);
+  fields.emplace_back("grant_type", "authorization_code");
+  fields.emplace_back("code_verifier", verifier);
+  DriveTokenGrant grant;
+  if (!PostDriveToken(fields, &grant, reason)) {
+    EmitLog("local-cover drive auth=exchange-failed reason=" + *reason);
+    return false;
+  }
+  if (!IsDriveRefreshToken(grant.refresh_token)) {
+    *reason = "consent-no-refresh-token";
+    EmitLog("local-cover drive auth=failed reason=" + *reason);
+    return false;
+  }
+  DriveState consented;
+  consented.refresh_token = grant.refresh_token;
+  consented.folder_id = state->folder_id;  // a re-consent keeps the known folder
+  if (!SaveDriveState(config.state_path, consented)) {
+    // The token is usable right now; only the next start will ask again.
+    EmitLog("local-cover drive auth=consented state=unwritten");
+  } else {
+    EmitLog("local-cover drive auth=consented");
+  }
+  *state = consented;
+  return true;
+}
+
+// The bearer token for this publish: the cached access token while it is fresh,
+// otherwise a refresh (or a consent when no usable sidecar exists).
+bool DriveAccessToken(const DriveConfig& config, std::string* token, std::string* reason) {
+  std::lock_guard<std::mutex> lock(g_drive_session_mutex);
+  const long long now = static_cast<long long>(std::time(nullptr));
+  if (!g_drive_access_token.empty() &&
+      now + kDriveAccessTokenSkewSeconds < g_drive_access_expires_at) {
+    *token = g_drive_access_token;
+    return true;
+  }
+
+  DriveState state;
+  if (!LoadDriveState(config.state_path, &state)) {
+    const long long tick = static_cast<long long>(GetTickCount64());
+    const long long failed_at = g_drive_consent_failed_at.load();
+    if (failed_at != 0 && tick - failed_at >= 0 &&
+        tick - failed_at < static_cast<long long>(kDriveConsentCooldownMs)) {
+      *reason = "drive-not-authorized";
+      return false;
+    }
+    if (!RunDriveConsent(config, &state, reason)) {
+      g_drive_consent_failed_at.store(static_cast<long long>(GetTickCount64()));
+      return false;
+    }
+    g_drive_consent_failed_at.store(0);
+  }
+
+  std::vector<std::pair<std::string, std::string>> fields;
+  fields.emplace_back("client_id", config.client_id);
+  fields.emplace_back("client_secret", config.client_secret);
+  fields.emplace_back("refresh_token", state.refresh_token);
+  fields.emplace_back("grant_type", "refresh_token");
+  DriveTokenGrant grant;
+  if (!PostDriveToken(fields, &grant, reason)) {
+    EmitLog("local-cover drive auth=refresh-failed reason=" + *reason);
+    // invalid_grant (400/401) is terminal: forget the sidecar so the next
+    // publish re-consents instead of retrying a dead token forever. The
+    // cooldown gates that consent, so a broken setup cannot pop a browser on
+    // every track.
+    if (*reason == "token-http-400" || *reason == "token-http-401") {
+      const std::wstring wide = Utils::ToWString(config.state_path);
+      if (!wide.empty()) {
+        DeleteFileW(wide.c_str());
+      }
+      g_drive_consent_failed_at.store(static_cast<long long>(GetTickCount64()));
+      *reason = "drive-reauth-required";
+    }
+    return false;
+  }
+  g_drive_access_token = grant.access_token;
+  const long long lifetime = grant.expires_in > 0 ? grant.expires_in : 3600;
+  g_drive_access_expires_at = now + lifetime;
+  EmitLog("local-cover drive auth=refreshed");
+  *token = grant.access_token;
+  return true;
+}
+
+// The folder id, cached in memory and in the sidecar so the lookup runs once
+// ever. A folder that already carries a public-read grant answers an
+// already-exists style error, which is success.
+bool SaveDriveFolderId(const DriveConfig& config, const std::string& folder_id) {
+  DriveState state;
+  if (!LoadDriveState(config.state_path, &state)) {
+    return false;  // never write a state file without a token
+  }
+  if (state.folder_id == folder_id) {
+    return true;
+  }
+  state.folder_id = folder_id;
+  return SaveDriveState(config.state_path, state);
+}
+
+bool EnsureDriveFolder(const DriveConfig& config, const std::string& access_token,
+                       std::string* folder_id, std::string* reason) {
+  {
+    std::lock_guard<std::mutex> lock(g_drive_session_mutex);
+    if (LooksLikeDriveFileId(g_drive_folder_id)) {
+      *folder_id = g_drive_folder_id;
+      return true;
+    }
+  }
+  DriveState state;
+  if (LoadDriveState(config.state_path, &state) && LooksLikeDriveFileId(state.folder_id)) {
+    std::lock_guard<std::mutex> lock(g_drive_session_mutex);
+    g_drive_folder_id = state.folder_id;
+    *folder_id = state.folder_id;
+    return true;
+  }
+
+  const std::wstring headers =
+      L"Authorization: Bearer " + Utils::ToWString(access_token) + L"\r\n";
+  const HttpResponse list =
+      SendHttp(L"GET", L"www.googleapis.com", Utils::ToWString(BuildDriveFolderQuery()), headers,
+               std::string());
+  if (!list.transport_ok) {
+    *reason = list.transport_reason.empty() ? std::string("folder-transport-failed")
+                                            : "folder-" + list.transport_reason;
+    return false;
+  }
+  if (list.status != 200) {
+    *reason = "folder-http-" + std::to_string(list.status);
+    return false;
+  }
+
+  std::string id = FirstDriveFileId(list.body);
+  if (id.empty()) {
+    const HttpResponse created =
+        SendHttp(L"POST", L"www.googleapis.com", L"/drive/v3/files?fields=id",
+                 headers + L"Content-Type: application/json\r\n", BuildDriveFolderMetadata());
+    if (!created.transport_ok) {
+      *reason = created.transport_reason.empty() ? std::string("folder-create-transport-failed")
+                                                 : "folder-create-" + created.transport_reason;
+      return false;
+    }
+    if (created.status != 200 && created.status != 201) {
+      *reason = "folder-create-http-" + std::to_string(created.status);
+      return false;
+    }
+    id = ExtractJsonStringField(created.body, "id");
+    if (!LooksLikeDriveFileId(id)) {
+      *reason = "folder-create-unexpected-body";
+      return false;
+    }
+  }
+
+  // Public read, once. Children inherit it, so no per-file permission call is
+  // ever made. Only an explicit already-exists answer is success; a refusal or a
+  // bad request fails the host and leaves the folder id unpersisted, so a later
+  // publish retries instead of reusing a folder nobody can fetch from.
+  const std::wstring permission_path =
+      L"/drive/v3/files/" + Utils::ToWString(id) + L"/permissions";
+  const HttpResponse permission =
+      SendHttp(L"POST", L"www.googleapis.com", permission_path,
+               headers + L"Content-Type: application/json\r\n", BuildDrivePermissionMetadata());
+  if (!permission.transport_ok) {
+    *reason = permission.transport_reason.empty() ? std::string("permission-transport-failed")
+                                                  : "permission-" + permission.transport_reason;
+    return false;
+  }
+  const DrivePermissionVerdict verdict =
+      ClassifyDrivePermission(permission.status, permission.body);
+  if (verdict == DrivePermissionVerdict::kDenied) {
+    EmitLog("local-cover drive folder permission=denied status=" +
+            std::to_string(permission.status));
+    *reason = "permission-denied";
+    return false;
+  }
+  if (verdict == DrivePermissionVerdict::kRejected) {
+    EmitLog("local-cover drive folder permission=rejected status=" +
+            std::to_string(permission.status));
+    *reason = permission.status == 400 ? std::string("permission-bad-request")
+                                       : "permission-http-" + std::to_string(permission.status);
+    return false;
+  }
+  if (verdict == DrivePermissionVerdict::kAlreadyShared) {
+    EmitLog("local-cover drive folder permission=already status=" +
+            std::to_string(permission.status));
+  }
+
+  SaveDriveFolderId(config, id);  // best effort: the memory cache survives the session
+  {
+    std::lock_guard<std::mutex> lock(g_drive_session_mutex);
+    g_drive_folder_id = id;
+  }
+  *folder_id = id;
+  return true;
+}
+
+// One Drive upload attempt. Authorisation, folder bootstrap and the upload are
+// all inside, because they are one host's round trip; a transport failure on
+// the upload itself is the only leg the caller retries (a retried token POST or
+// folder create would be wasted, and both are safe to repeat anyway).
+UploadAttempt UploadDriveImage(const std::string& name, const std::string& mime,
+                               const std::vector<unsigned char>& image) {
+  const DriveConfig config = SnapshotDriveConfig();
+  if (!DriveConfigured(config)) {
+    return AttemptResult(Failure("drive-not-configured"));
+  }
+  std::string access_token;
+  std::string reason;
+  if (!DriveAccessToken(config, &access_token, &reason)) {
+    return AttemptResult(Failure(reason.empty() ? std::string("drive-auth-failed") : reason));
+  }
+  std::string folder_id;
+  if (!EnsureDriveFolder(config, access_token, &folder_id, &reason)) {
+    return AttemptResult(Failure(reason));
+  }
+
+  const std::string boundary = MakeBoundary();
+  const std::string body =
+      BuildDriveMultipartBody(boundary, name, folder_id, SanitizeMime(mime.c_str()), image);
+  if (body.size() > 0xffffffffull) {
+    return AttemptResult(Failure("body-too-large"));
+  }
+  const std::wstring headers =
+      L"Authorization: Bearer " + Utils::ToWString(access_token) + L"\r\n" +
+      L"Content-Type: " + Utils::ToWString(DriveMultipartContentType(boundary)) + L"\r\n";
+  const HttpResponse response =
+      SendHttp(L"POST", L"www.googleapis.com",
+               L"/upload/drive/v3/files?uploadType=multipart&fields=id", headers, body);
+  if (!response.transport_ok) {
+    UploadAttempt attempt;
+    attempt.result = Failure(response.transport_reason.empty()
+                                 ? std::string("upload-transport-failed")
+                                 : "upload-" + response.transport_reason);
+    attempt.transport_failure = true;
+    return attempt;
+  }
+  if (response.status == 0) {
+    // The host answered but the status was unreadable: a real answer, so no
+    // retry (it may already have created the file).
+    return AttemptResult(Failure("upload-" + response.transport_reason));
+  }
+  return AttemptResult(ClassifyDriveUpload(response.status, response.body));
+}
+
 // Dispatches one attempt to the transport that matches the host's shape. The
 // GitHub host needs the owner/repo (from the guarded config) and the cover name;
 // the keyless hosts build their multipart body here.
 UploadAttempt AttemptHostUpload(const UploadHost& upload_host, const PreparedImage& prepared) {
+  if (upload_host.shape == UploadShape::kDrive) {
+    // The file is named by the hash of the uploaded bytes, matching the cache
+    // key and the GitHub host's convention, so the existing cache dedupes.
+    return UploadDriveImage(UploadCacheKey(prepared), prepared.mime, prepared.bytes);
+  }
   if (upload_host.shape == UploadShape::kGitHub) {
     std::wstring owner;
     std::wstring repo;
@@ -1610,19 +3079,97 @@ HostOutcome TryUploadHost(const UploadHost& upload_host, const PreparedImage& pr
   return outcome;
 }
 
-// Uploads to the permanent GitHub host only: the upgrade path for a cache hit
-// on an ephemeral keyless URL. The caller falls back to revalidation when this
-// fails, so a dead ephemeral URL is never sent. Answers github-not-configured
-// without touching the network when the host is not active.
+// std::exception::what() can carry arbitrary text; keep a log line single-line
+// and short. Image bytes never reach an exception message.
+std::string ExceptionText(const char* what) {
+  if (what == nullptr) {
+    return "unknown";
+  }
+  std::string text;
+  for (const char* c = what; *c != '\0' && text.size() < 120; ++c) {
+    text.push_back((*c == '\r' || *c == '\n' || *c == '\t') ? ' ' : *c);
+  }
+  return text.empty() ? std::string("unknown") : text;
+}
+
+// A host attempt that throws must not end the chain: the cause is logged, that
+// host counts as failed, and the caller moves on to the next host. Used by the
+// fresh chain and by the cache-upgrade legs, so a throw in an upgrade host still
+// falls back to revalidating the cached URL.
+HostOutcome TryUploadHostGuarded(const UploadHost& upload_host, const PreparedImage& prepared) {
+  try {
+    return TryUploadHost(upload_host, prepared);
+  } catch (const std::exception& error) {
+    EmitLog("local-cover host=" + HostNameUtf8(upload_host) + " exception=" +
+            ExceptionText(error.what()));
+  } catch (...) {
+    EmitLog("local-cover host=" + HostNameUtf8(upload_host) + " exception=unknown");
+  }
+  HostOutcome outcome;
+  outcome.result = Failure("exception");
+  outcome.result.host = HostNameUtf8(upload_host);
+  outcome.attempts = 1;
+  return outcome;
+}
+
+// Uploads to the permanent GitHub host only. Answers github-not-configured
+// without touching the network when the host is not in the chain.
 HostOutcome TryGitHubUpload(const PreparedImage& prepared) {
   const std::vector<UploadHost> hosts = ActiveHosts();
   for (size_t i = 0; i < hosts.size(); ++i) {
     if (hosts[i].shape == UploadShape::kGitHub) {
-      return TryUploadHost(hosts[i], prepared);
+      return TryUploadHostGuarded(hosts[i], prepared);
     }
   }
   HostOutcome outcome;
   outcome.result = Failure("github-not-configured");
+  return outcome;
+}
+
+// The same for the permanent Drive host; drive-not-configured when the policy
+// does not put it in the chain (or its credentials are absent).
+HostOutcome TryDriveUpload(const PreparedImage& prepared) {
+  const std::vector<UploadHost> hosts = ActiveHosts();
+  for (size_t i = 0; i < hosts.size(); ++i) {
+    if (hosts[i].shape == UploadShape::kDrive) {
+      return TryUploadHostGuarded(hosts[i], prepared);
+    }
+  }
+  HostOutcome outcome;
+  outcome.result = Failure("drive-not-configured");
+  return outcome;
+}
+
+// The permanent hosts the current policy allows a cache upgrade to use, in
+// chain order. Read under the same lock as ActiveHosts(), so the cache path and
+// a fresh upload can never disagree about the policy.
+std::vector<PermanentHost> CurrentUpgradeHosts() {
+  std::lock_guard<std::mutex> lock(g_host_mutex);
+  return PlanCacheUpgrade(g_cover_host, DriveConfiguredLocked(), GitHubConfiguredLocked());
+}
+
+std::string CurrentPolicyName() {
+  std::lock_guard<std::mutex> lock(g_host_mutex);
+  return PolicyName(g_cover_host);
+}
+
+// Re-publishes prepared bytes to the policy's permanent hosts, in chain order,
+// stopping at the first success. A keyless policy answers "no-permanent-host"
+// without touching the network. The caller revalidates the cached URL when this
+// fails, so a dead ephemeral URL is never sent.
+HostOutcome UpgradeCachedUrl(const PreparedImage& prepared) {
+  const std::vector<PermanentHost> order = CurrentUpgradeHosts();
+  HostOutcome outcome;
+  outcome.result = Failure("no-permanent-host");
+  for (size_t i = 0; i < order.size(); ++i) {
+    outcome = order[i] == PermanentHost::kDrive ? TryDriveUpload(prepared)
+                                                : TryGitHubUpload(prepared);
+    if (outcome.result.ok) {
+      return outcome;
+    }
+    EmitLog("local-cover upgrade-host-failed host=" + outcome.result.host + " reason=" +
+            outcome.result.reason);
+  }
   return outcome;
 }
 
@@ -1655,6 +3202,12 @@ void EmitLog(const std::string& line) {
 // logs "auth=rejected" with the status only.
 void LogGitHubAuthState() {
   EmitLog(std::string("local-cover github auth=") + (GitHubTokenPresent() ? "present" : "absent"));
+}
+
+// Names the Drive host's state, never a token or the secret: whether the host is
+// in this chain at all, and (below) why one attempt failed.
+void LogDriveHostState() {
+  EmitLog(std::string("local-cover drive host=") + (DriveUploadActive() ? "active" : "inactive"));
 }
 
 void LogGitHubAuthRejected(const std::string& status) {
@@ -1694,6 +3247,24 @@ std::string ConfiguredHostName(size_t index) {
   return index < hosts.size() ? Utils::ToString(hosts[index].name) : std::string();
 }
 
+// The last line of defence: a throw outside one host attempt (image
+// preparation, the cache) still logs the reason, records the failure for the
+// existing negative TTL and answers the caller. It never rethrows into AIMP's
+// thread. The entry is keyed by the source bytes because the prepared bytes may
+// not exist; a later success replaces it under the real (prepared) key.
+Result PublishException(const std::vector<unsigned char>& image_bytes, const char* what) {
+  Result result = Failure("exception");
+  try {
+    EmitLog("local-cover failed reason=exception text=" + ExceptionText(what));
+    const std::string key = Sha256Hex(image_bytes);
+    CacheStore(key, result, static_cast<long long>(std::time(nullptr)));
+    result.detail = "key=" + key + " attempts=0 host=exception";
+  } catch (...) {
+    // Nothing further may escape: the caller is AIMP's publisher worker.
+  }
+  return result;
+}
+
 }  // namespace
 
 // --- Public interface -------------------------------------------------------
@@ -1724,6 +3295,50 @@ void ConfigureAuth(const std::string& token, const std::string& repo) {
   g_github_repo = name;
 }
 
+void ConfigureHost(const std::string& value) {
+  std::lock_guard<std::mutex> lock(g_host_mutex);
+  g_cover_host = ParseCoverHostPolicy(value);
+}
+
+void LogHostConfiguration() {
+  HostConfigSummary summary;
+  {
+    std::lock_guard<std::mutex> lock(g_host_mutex);
+    const bool github_token = !g_github_token.empty();
+    const bool github_repo = !g_github_owner.empty() && !g_github_repo.empty();
+    summary.policy = g_cover_host;
+    summary.drive_usable = DriveConfiguredLocked();
+    summary.github_usable = github_token && github_repo;
+    summary.drive_reason = DriveUnavailableReason(
+        !g_drive_client_id.empty(), !g_drive_client_secret.empty(), !g_drive_state_path.empty());
+    summary.github_reason = GitHubUnavailableReason(github_token, github_repo);
+  }
+  // Host names, the policy and fixed tokens only: no token or secret value,
+  // and not even a prefix or a length of one.
+  EmitLog(FormatHostConfigLine(summary));
+}
+
+void ConfigureDrive(const std::string& client_id, const std::string& client_secret,
+                    const std::string& state_path) {
+  // A previous configuration's access token and folder id no longer apply, and
+  // a cancel left over from an earlier unload is cleared here (this runs at
+  // plugin load, before any publish).
+  g_drive_consent_cancel.store(false);
+  {
+    std::lock_guard<std::mutex> session(g_drive_session_mutex);
+    g_drive_access_token.clear();
+    g_drive_access_expires_at = 0;
+    g_drive_folder_id.clear();
+  }
+  g_drive_consent_failed_at.store(0);
+  std::lock_guard<std::mutex> lock(g_host_mutex);
+  g_drive_client_id = client_id;
+  g_drive_client_secret = client_secret;
+  g_drive_state_path = state_path;
+}
+
+void CancelDriveConsent() { g_drive_consent_cancel.store(true); }
+
 Result Publish(const std::vector<unsigned char>& image_bytes, const char* mime) {
   try {
     if (image_bytes.empty()) {
@@ -1742,17 +3357,20 @@ Result Publish(const std::vector<unsigned char>& image_bytes, const char* mime) 
         return cached;
       }
       // A hit on an ephemeral keyless URL is never trusted blindly: with a
-      // token the local bytes are re-published to the permanent GitHub host
-      // and the cache is updated; without one the stored URL is revalidated
-      // and a dead entry falls through to a fresh keyless upload below, which
-      // overwrites it. Either way a dead cached URL is never sent.
-      const CachedUrlAction action = PlanCachedUrl(cached.url, GitHubUploadActive());
+      // permanent host selected by the policy (Drive and/or GitHub, in chain
+      // order) the local bytes are re-published there and the cache is updated;
+      // with none the stored URL is revalidated and a dead entry falls through
+      // to a fresh keyless upload below, which overwrites it. Either way a dead
+      // cached URL is never sent, and CoverHost=keyless never reaches an
+      // authenticated host.
+      const std::vector<PermanentHost> upgrade_hosts = CurrentUpgradeHosts();
+      const CachedUrlAction action = PlanCachedUrl(cached.url, !upgrade_hosts.empty());
       if (action == CachedUrlAction::kUse) {
         cached.detail = prepared.note + " key=" + key + " cache=hit";
         return cached;
       }
-      if (action == CachedUrlAction::kUpgradeToGitHub) {
-        const HostOutcome upgrade = TryGitHubUpload(prepared);
+      if (action == CachedUrlAction::kUpgradeToPermanent) {
+        const HostOutcome upgrade = UpgradeCachedUrl(prepared);
         if (upgrade.result.ok) {
           Result result = upgrade.result;
           LogHostSuccess(result);
@@ -1766,6 +3384,12 @@ Result Publish(const std::vector<unsigned char>& image_bytes, const char* mime) 
                 upgrade.result.reason + " host=" + upgrade.result.host);
         // Fall through to revalidation: a failed upgrade must not resurrect a
         // possibly-dead ephemeral URL.
+      } else {
+        // No permanent host is in the chain for this policy: say so, with the
+        // policy, so a cache hit that never tries Drive or GitHub is explained
+        // by one line instead of an absence of lines.
+        EmitLog("local-cover cache-upgrade-skipped key=" + key +
+                " reason=no-permanent-host policy=" + CurrentPolicyName());
       }
       const HealthCheck health = HealthCheckUrl(cached.url);
       if (health.ok) {
@@ -1775,22 +3399,30 @@ Result Publish(const std::vector<unsigned char>& image_bytes, const char* mime) 
       EmitLog("local-cover cache-stale key=" + key + " reason=" + health.reason);
     }
 
-    // Ordered fallback inside one publish: GitHub first when a token is set
-    // (the owner's permanent repo), then catbox, then uguu, then the dormant
+    // Ordered fallback inside one publish: the policy's preferred host first
+    // (Drive and/or GitHub), then catbox, then uguu, then the dormant
     // litterbox. All are the same layer - a host failure never skips the online
-    // rung. Each host is retried once on a transport failure only.
+    // rung. Each host is retried once on a transport failure only, and a host
+    // that throws is logged and skipped rather than ending the chain.
     LogGitHubAuthState();
+    LogDriveHostState();
     const std::vector<UploadHost> hosts = ActiveHosts();
     Result result;
     int total_attempts = 0;
     for (size_t i = 0; i < hosts.size(); ++i) {
-      const HostOutcome outcome = TryUploadHost(hosts[i], prepared);
+      const HostOutcome outcome = TryUploadHostGuarded(hosts[i], prepared);
       total_attempts += outcome.attempts;
       if (!outcome.result.ok && hosts[i].shape == UploadShape::kGitHub) {
         const std::string& reason = outcome.result.reason;
         if (reason == "http-401" || reason == "http-403") {
           LogGitHubAuthRejected(reason.substr(5));
         }
+      }
+      if (!outcome.result.ok && hosts[i].shape == UploadShape::kDrive) {
+        // Every Drive failure names a reason and then falls through to the
+        // next host exactly as any other host failure does.
+        EmitLog("local-cover drive failed reason=" +
+                (outcome.result.reason.empty() ? std::string("unknown") : outcome.result.reason));
       }
       if (outcome.result.ok) {
         result = outcome.result;
@@ -1807,8 +3439,10 @@ Result Publish(const std::vector<unsigned char>& image_bytes, const char* mime) 
                     " host=" + (result.host.empty() ? HostListToken() : result.host);
     CacheStore(key, result, now);
     return result;
+  } catch (const std::exception& error) {
+    return PublishException(image_bytes, error.what());
   } catch (...) {
-    return Failure("exception");
+    return PublishException(image_bytes, "unknown");
   }
 }
 

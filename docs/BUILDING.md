@@ -92,8 +92,8 @@ find the Profile folder location in AIMP's settings.)
 | `ApplicationID` | integer | Discord application ID used to publish the presence. The default is the shared upstream ID. You may substitute your own ID (create one in the [Discord developer portal](https://discord.com/developers/applications)). |
 | `Timestamp` | bool | Show playback timestamps. `0` = elapsed time, `1` = remaining time. |
 | `UseAlbumArt` | bool | Use the album art as the large image. `0` = off, `1` = on. |
-| `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes, then MusicBrainz + Cover Art Archive). `0` = never go online; always use the black fallback image. `1` = allow online lookups. |
-| `LocalCover`, `CoverCache` | bool, string | Publish the track's own (offline) cover so Discord can fetch the real artwork. `LocalCover`: `0` = off, `1` = on (default); a published cover is used only after the upload proves retrievable. The local image is uploaded through a host chain - GitHub (only when `CoverToken` is set), catbox, uguu, then litterbox - and a host failure falls through to the online lookup, never straight to black. `CoverCache`: optional file that remembers published cover URLs by image hash. Empty (the default) resolves to `cover-cache.txt` beside the plugin DLL; a bare filename resolves there too, an absolute path is used as given. |
+| `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes, then MusicBrainz + Cover Art Archive). `0` = never go online; the card keeps the plugin's built-in placeholder image. `1` = allow online lookups. |
+| `LocalCover`, `CoverCache` | bool, string | Publish the track's own (offline) cover so Discord can fetch the real artwork. `LocalCover`: `0` = off, `1` = on (default); a published cover is used only after the upload proves retrievable. The local image is uploaded through a host chain - GitHub (only when `CoverToken` is set), catbox, uguu, then litterbox - and a host failure falls through to the online lookup, never straight to the placeholder. `CoverCache`: optional file that remembers published cover URLs by image hash. Empty (the default) resolves to `cover-cache.txt` beside the plugin DLL; a bare filename resolves there too, an absolute path is used as given. |
 | `CoverToken`, `CoverRepo` | string, string | **Optional** permanent GitHub upload host. `CoverToken` is a fine-grained personal access token with `contents: write` for the repository. An **empty token (the default) is fine**: it simply omits the GitHub host, and the keyless hosts handle the upload with no behaviour change. When set, GitHub is tried first, and the token is sent **only** to `api.github.com`; it is never logged, printed, or written to `CoverCache`. `CoverRepo`: the `owner/name` repository that receives the covers; empty (the default) uses `nathwn12/aimp-discord-presence-art`. |
 | `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **artist** (the `state` line), `2` = **track title** (the `details` line). Default: `2`. |
 | `Name` | string | Application name shown above the activity card. Default: `Music`. Truncated to 128 characters; an empty value omits the field. |
@@ -143,8 +143,8 @@ in the template survives unchanged. Button **labels** are never encoded.
 ; Discord application ID. Default is the shared upstream ID; replace with your own if you like.
 ApplicationID=429559336982020107
 
-; Show playback timestamps (0 - elapsed time / 1 - time remaining). Default: 0
-Timestamp=0
+; Show playback timestamps (0 - elapsed time / 1 - time remaining). Default: 1
+Timestamp=1
 
 ; Use the album art as the large image. Default: 1
 UseAlbumArt=1
@@ -199,7 +199,8 @@ enabled and AIMP has been restarted.
 The large image is filled from online lookups only when both `UseAlbumArt=1` and
 `UseAlbumArtOnline=1`. If `UseAlbumArtOnline=0`, or the track cannot be matched by
 the keyless providers (Deezer `/search/album`, iTunes Search, MusicBrainz + Cover
-Art Archive), the plugin falls back to a solid black PNG by design.
+Art Archive), the card shows the plugin's built-in placeholder image instead of a
+real cover.
 
 **My configuration changes do nothing.**
 AIMP must be **closed** while you edit `Profile/AIMP.ini`. Reopen AIMP after

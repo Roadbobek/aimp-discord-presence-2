@@ -155,6 +155,18 @@ class AimpDiscordPresence :
     // token is never logged, cached, or written anywhere by the plugin.
     std::wstring cover_token;
     std::wstring cover_repo = L"nathwn12/aimp-discord-presence-art";
+    // Preferred cover host: "auto" (the default) uses Google Drive when its
+    // credentials exist, otherwise GitHub when a token exists, and falls back to
+    // the anonymous keyless hosts either way. "drive", "github" and "keyless"
+    // pin the preference; the keyless hosts always remain the last resort.
+    std::wstring cover_host = L"auto";
+    // Google Drive upload host: the owner's own OAuth desktop client. With
+    // either value empty (the default) Drive is simply absent from the chain.
+    // The secret is never logged or written; the refresh token lives in
+    // drive-token.txt next to the cover cache, and the one-time browser consent
+    // runs on the cover worker thread.
+    std::wstring drive_client_id;
+    std::wstring drive_client_secret;
     // What the member-list status line shows: 0 = name, 1 = state (artist),
     // 2 = details (track title). Defaults to 2, the track title.
     int status_display_type = 2;

@@ -1567,6 +1567,674 @@ void TestCachedUrlPlan() {
   Check(!GitHubUploadActive(), "plan: no token -> github inactive");
 }
 
+// --- Google Drive host: PKCE, consent URL, sidecar, body, URL, policy --------
+//
+// All of this is pure or file-local: no test here performs a network call, and
+// none needs OAuth credentials.
+
+void TestDrivePkce() {
+  // RFC 7636 appendix B, the published S256 vector.
+  Check(PkceCodeChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") ==
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        "pkce: the RFC 7636 S256 test vector matches");
+
+  const std::string verifier = PkceCodeVerifier();
+  Check(verifier.size() == 43, "pkce: the verifier is 43 characters");
+  Check(verifier.find_first_not_of(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") ==
+            std::string::npos,
+        "pkce: the verifier is base64url only (no padding, no + or /)");
+  const std::string challenge = PkceCodeChallenge(verifier);
+  Check(challenge.size() == 43, "pkce: the S256 challenge is 43 characters");
+  Check(challenge != verifier, "pkce: the challenge is not the verifier");
+  Check(PkceCodeChallenge(verifier) == challenge, "pkce: the challenge is deterministic");
+  Check(PkceCodeVerifier() != verifier, "pkce: two verifiers differ");
+  Check(OAuthStateToken().size() == 22, "pkce: a 16-byte state token is 22 characters");
+  Check(Base64UrlEncode(nullptr, 0).empty(), "pkce: empty input encodes to nothing");
+}
+
+void TestDriveAuthUrl() {
+  const std::string client_id = "1234567890-abcdef.apps.googleusercontent.com";
+  const std::string redirect = "http://127.0.0.1:49152/";
+  const std::string verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+  const std::string state = "state-token-123";
+  const std::string url = BuildDriveAuthUrl(client_id, redirect, verifier, state);
+
+  Check(url.compare(0, std::strlen(kDriveAuthEndpoint), kDriveAuthEndpoint) == 0,
+        "auth url: starts at the Google authorization endpoint");
+  Check(url.find("client_id=" + client_id) != std::string::npos,
+        "auth url: carries the client id");
+  Check(url.find("redirect_uri=http%3A%2F%2F127.0.0.1%3A49152%2F") != std::string::npos,
+        "auth url: the redirect is the loopback listener on 127.0.0.1");
+  Check(url.find("response_type=code") != std::string::npos, "auth url: asks for a code");
+  Check(url.find("scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file") !=
+            std::string::npos,
+        "auth url: asks for drive.file only");
+  Check(url.find("access_type=offline") != std::string::npos,
+        "auth url: asks for offline access (the refresh token)");
+  Check(url.find("prompt=consent") != std::string::npos,
+        "auth url: forces the consent prompt so a refresh token is issued");
+  Check(url.find("code_challenge=" + PkceCodeChallenge(verifier)) != std::string::npos,
+        "auth url: carries the S256 challenge, not the verifier");
+  Check(url.find("code_challenge_method=S256") != std::string::npos,
+        "auth url: names the S256 method");
+  Check(url.find("state=" + state) != std::string::npos, "auth url: carries the state token");
+  Check(url.find(verifier) == std::string::npos, "auth url: never carries the verifier");
+  Check(url.find("client_secret") == std::string::npos, "auth url: never carries the client secret");
+  Check(url.find('?') == url.rfind('?'), "auth url: one query string");
+}
+
+void TestDriveTokenState(const std::wstring& directory) {
+  DriveState state;
+  Check(!ParseDriveState("", &state), "drive state: an empty file is not authenticated");
+  Check(!ParseDriveState("# a comment only\n", &state),
+        "drive state: a comment-only file is not authenticated");
+  Check(!ParseDriveState("refresh_token=\n", &state), "drive state: a blank token is not authenticated");
+  Check(!ParseDriveState("refresh_token=short\n", &state), "drive state: a too-short token is corrupt");
+  Check(!ParseDriveState(std::string("refresh_token=1//0gAbCdEfGhIjKlMnOpQrSt\njunk line\n"), &state),
+        "drive state: a line that is not key=value is corrupt");
+  Check(!ParseDriveState("refresh_token=1//0gAbCdEfGhIjKlMnOpQrSt\nunknown=1\n", &state),
+        "drive state: an unknown key is corrupt");
+  Check(ParseDriveState("refresh_token=1//0gAbCdEfGhIjKlMnOpQrSt\nfolder_id=nope!\n", &state) &&
+            state.folder_id.empty(),
+        "drive state: an impossible folder id is dropped, the token still parses");
+
+  DriveState original;
+  original.refresh_token = "1//0gAbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+  original.folder_id = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123";
+  const std::string text = FormatDriveState(original);
+  DriveState parsed;
+  Check(ParseDriveState(text, &parsed), "drive state: a formatted state parses back");
+  Check(parsed.refresh_token == original.refresh_token && parsed.folder_id == original.folder_id,
+        "drive state: the round trip preserves the token and the folder id");
+  Check(text.find("access_token") == std::string::npos &&
+            text.find("client_secret") == std::string::npos,
+        "drive state: only the refresh token and folder id are ever written");
+
+  // The real reader and writer, in the test's own scratch directory.
+  CreateDirectoryW(directory.c_str(), nullptr);
+  const std::wstring path = directory + L"\\drive-token.txt";
+  DeleteFileW(path.c_str());
+  const std::string utf8_path = Utils::ToString(path);
+  DriveState loaded;
+  Check(!LoadDriveState(utf8_path, &loaded), "drive state: a missing sidecar is not authorized");
+  Check(SaveDriveState(utf8_path, original), "drive state: the sidecar is written");
+  Check(LoadDriveState(utf8_path, &loaded) && loaded.refresh_token == original.refresh_token &&
+            loaded.folder_id == original.folder_id,
+        "drive state: the sidecar reads back through the real file path");
+
+  const std::wstring corrupt_path = directory + L"\\drive-token-corrupt.txt";
+  {
+    HANDLE file = CreateFileW(corrupt_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    Check(file != INVALID_HANDLE_VALUE, "drive state: the corrupt fixture is created");
+    if (file != INVALID_HANDLE_VALUE) {
+      const char junk[] = "\x01\x02 not a state file \x00";
+      DWORD written = 0;
+      WriteFile(file, junk, static_cast<DWORD>(sizeof(junk) - 1), &written, nullptr);
+      CloseHandle(file);
+    }
+  }
+  Check(!LoadDriveState(Utils::ToString(corrupt_path), &loaded),
+        "drive state: a corrupt sidecar is not authorized (consent runs again)");
+  DeleteFileW(corrupt_path.c_str());
+  DeleteFileW(path.c_str());
+  RemoveDirectoryW(directory.c_str());
+}
+
+void TestDriveFolderQuery() {
+  const std::string query = BuildDriveFolderQuery();
+  Check(query.compare(0, 16, "/drive/v3/files?") == 0, "folder query: targets the files collection");
+  Check(query.find(
+            "q=name%3D%27aimp-covers%27%20and%20mimeType%3D%27application%2Fvnd.google-apps.folder"
+            "%27%20and%20trashed%3Dfalse") != std::string::npos,
+        "folder query: filters on name, folder mimeType and trashed=false");
+  Check(query.find("&spaces=drive") != std::string::npos, "folder query: searches Drive");
+  Check(query.find("&fields=files(id)") != std::string::npos,
+        "folder query: asks for ids only");
+  Check(query.find("&pageSize=10") != std::string::npos, "folder query: is bounded");
+  Check(query.find(' ') == std::string::npos && query.find('\'') == std::string::npos,
+        "folder query: every space and quote is percent-encoded");
+  Check(BuildDriveFolderMetadata().find("\"mimeType\":\"application/vnd.google-apps.folder\"") !=
+            std::string::npos,
+        "folder create: names the folder mimeType");
+  Check(BuildDrivePermissionMetadata() == "{\"role\":\"reader\",\"type\":\"anyone\"}",
+        "folder permission: public read for anyone");
+}
+
+void TestDriveMultipart() {
+  const std::string boundary = "----driveBoundary";
+  const std::string name = Sha256Hex(std::vector<unsigned char>{'d', 'r', 'i', 'v', 'e'});
+  const std::string folder = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123";
+  const std::vector<unsigned char> image = {'x', 'y', 'z', 0x00, 0xff};
+  const std::string body = BuildDriveMultipartBody(boundary, name, folder, "image/jpeg", image);
+
+  Check(DriveMultipartContentType(boundary) == "multipart/related; boundary=" + boundary,
+        "drive body: the request content type is multipart/related with the boundary");
+  Check(body.compare(0, boundary.size() + 4, "--" + boundary + "\r\n") == 0,
+        "drive body: opens with the boundary delimiter");
+
+  size_t parts = 0;
+  for (size_t at = body.find("--" + boundary + "\r\n"); at != std::string::npos;
+       at = body.find("--" + boundary + "\r\n", at + 1)) {
+    ++parts;
+  }
+  Check(parts == 2, "drive body: exactly two parts");
+  Check(body.size() >= boundary.size() + 6 &&
+            body.compare(body.size() - (boundary.size() + 6), boundary.size() + 6,
+                         "--" + boundary + "--\r\n") == 0,
+        "drive body: closes with the boundary delimiter");
+  Check(body.find("Content-Disposition") == std::string::npos,
+        "drive body: never uses a form-data disposition");
+
+  const std::string metadata = BuildDriveMetadataPart(name, folder);
+  Check(metadata.find("\"name\":\"" + name + "\"") != std::string::npos &&
+            metadata.find("\"parents\":[\"" + folder + "\"]") != std::string::npos,
+        "drive body: the metadata names the file and its parent folder");
+  Check(body.find("Content-Type: application/json; charset=UTF-8\r\n\r\n" + metadata + "\r\n") !=
+            std::string::npos,
+        "drive body: the JSON metadata is the first part");
+  Check(body.find("Content-Type: image/jpeg\r\n\r\n") != std::string::npos,
+        "drive body: the second part announces the image type");
+
+  const std::string image_header = "Content-Type: image/jpeg\r\n\r\n";
+  const size_t image_at = body.find(image_header);
+  Check(image_at != std::string::npos && image_at + image_header.size() + image.size() <= body.size() &&
+            std::memcmp(body.data() + image_at + image_header.size(), image.data(), image.size()) == 0,
+        "drive body: the bytes follow the second part's headers exactly once");
+  Check(body.find("x") != std::string::npos, "drive body: the image bytes are present");
+}
+
+void TestDriveLh3Url() {
+  const std::string id = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123";
+  const std::string url = DriveLh3Url(id);
+
+  Check(url == "https://lh3.googleusercontent.com/d/" + id,
+        "drive url: built from the lh3 short-link prefix");
+  Check(url.size() < 300, "drive url: fits the presence payload's 300-character budget");
+  Check(LooksLikeUploadUrl(url), "drive url: recognised as an upload url");
+  Check(!IsEphemeralCachedUrl(url), "drive url: a cached drive url is durable");
+  Check(PlanCachedUrl(url, true) == CachedUrlAction::kUse,
+        "drive url: reused as-is even with github active");
+  Check(PlanCachedUrl(url, false) == CachedUrlAction::kUse,
+        "drive url: reused as-is without a token");
+  Check(!LooksLikeUploadUrl(url + "=w1024"), "drive url: a size suffix is not the cached form");
+  Check(!LooksLikeUploadUrl("https://lh3.googleusercontent.com.evil.test/d/" + id),
+        "drive url: a lookalike host is rejected");
+  Check(!LooksLikeUploadUrl("https://evil.test/d/" + id), "drive url: any other host is rejected");
+  Check(!LooksLikeUploadUrl("https://lh3.googleusercontent.com/d/short"),
+        "drive url: a too-short id is rejected");
+
+  const Result ok = ClassifyDriveUpload(200, "{\"id\":\"" + id + "\"}");
+  Check(ok.ok && ok.url == url, "drive classify: 200 with a file id yields the lh3 url");
+  const Result created = ClassifyDriveUpload(201, "{\n  \"id\": \"" + id + "\"\n}");
+  Check(created.ok && created.url == url, "drive classify: 201 with a file id yields the lh3 url");
+  Check(!ClassifyDriveUpload(200, "{}").ok, "drive classify: 200 without an id is a failure");
+  Check(ClassifyDriveUpload(401, "").reason == "drive-http-401",
+        "drive classify: 401 names the status");
+  const Result forbidden = ClassifyDriveUpload(403, "{\"error\":{\"reason\":\"quotaExceeded\"}}");
+  Check(!forbidden.ok && forbidden.reason == "drive-http-403",
+        "drive classify: 403 names the status only, never the body");
+  Check(forbidden.reason.find("quota") == std::string::npos,
+        "drive classify: nothing from the response body is echoed");
+  Check(ClassifyDriveUpload(429, "").reason == "drive-quota",
+        "drive classify: 429 is named as quota");
+}
+
+void TestDriveCacheLine() {
+  const std::string key = Sha256Hex(std::vector<unsigned char>{'d', 'r', 'i', 'v', 'e'});
+  const std::string url = DriveLh3Url("1AbCdEfGhIjKlMnOpQrStUvWxYz0123");
+
+  CacheEntry entry;
+  entry.ok = true;
+  entry.payload = url;
+  const std::string line = FormatCacheLine(key, entry);
+  Check(line == key + "\tok\t" + url, "drive cache: an ok line is <sha256> ok <url>");
+  std::string parsed_key;
+  CacheEntry parsed;
+  Check(ParseCacheLine(line, &parsed_key, &parsed) && parsed_key == key && parsed.ok &&
+            parsed.payload == url,
+        "drive cache: the ok line parses back to the same url");
+
+  CacheEntry failure;
+  failure.ok = false;
+  failure.expires_at = 1700000000;
+  failure.payload = "drive-http-403";
+  const std::string failure_line = FormatCacheLine(key, failure);
+  Check(ParseCacheLine(failure_line, &parsed_key, &parsed) && !parsed.ok &&
+            parsed.expires_at == 1700000000 && parsed.payload == "drive-http-403",
+        "drive cache: a failure line parses back with its ttl and reason");
+  Check(LooksLikeUploadUrl(url),
+        "drive cache: the stored url passes the cache's own validation");
+}
+
+void TestCoverHostSelection() {
+  Check(ParseCoverHostPolicy("") == CoverHostPolicy::kAuto, "policy: empty reads as auto");
+  Check(ParseCoverHostPolicy("auto") == CoverHostPolicy::kAuto, "policy: auto reads as auto");
+  Check(ParseCoverHostPolicy(" Drive ") == CoverHostPolicy::kDrive,
+        "policy: drive is trimmed and case-insensitive");
+  Check(ParseCoverHostPolicy("GITHUB") == CoverHostPolicy::kGithub, "policy: github reads as github");
+  Check(ParseCoverHostPolicy("keyless") == CoverHostPolicy::kKeyless,
+        "policy: keyless reads as keyless");
+  Check(ParseCoverHostPolicy("nonsense") == CoverHostPolicy::kAuto, "policy: a typo reads as auto");
+
+  struct Row {
+    CoverHostPolicy policy;
+    bool drive_available;
+    bool github_available;
+    bool want_drive;
+    bool want_github;
+    const char* label;
+  };
+  const Row rows[] = {
+      {CoverHostPolicy::kAuto, false, false, false, false, "auto, nothing configured -> keyless only"},
+      {CoverHostPolicy::kAuto, true, false, true, false, "auto with drive creds -> drive"},
+      {CoverHostPolicy::kAuto, false, true, false, true, "auto with a token -> github"},
+      {CoverHostPolicy::kAuto, true, true, true, false, "auto with both -> drive, no second upload"},
+      {CoverHostPolicy::kDrive, true, true, true, false, "drive pinned -> drive"},
+      {CoverHostPolicy::kDrive, false, true, false, false, "drive pinned without creds -> keyless"},
+      {CoverHostPolicy::kGithub, true, true, false, true, "github pinned -> github"},
+      {CoverHostPolicy::kGithub, true, false, false, false, "github pinned without a token -> keyless"},
+      {CoverHostPolicy::kKeyless, true, true, false, false, "keyless pinned -> no authenticated host"},
+  };
+  for (const Row& row : rows) {
+    const HostChainPlan plan = PlanHostChain(row.policy, row.drive_available, row.github_available);
+    Check(plan.drive == row.want_drive && plan.github == row.want_github,
+          std::string("policy: ") + row.label);
+  }
+
+  // The live chain, through the same configuration the plugin uses.
+  CoverPublisher::ConfigureAuth("test-token", "");
+  CoverPublisher::ConfigureDrive("client-id", "client-secret", "C:\\temp\\drive-token.txt");
+  CoverPublisher::ConfigureHost("keyless");
+  Check(ConfiguredHostCount() == 3, "policy: keyless pin keeps the three anonymous hosts");
+  Check(!DriveUploadActive(), "policy: keyless pin leaves drive inactive");
+
+  CoverPublisher::ConfigureHost("drive");
+  Check(DriveUploadActive(), "policy: drive pin with credentials -> active");
+  Check(ConfiguredHostName(0) == "drive.google.com", "policy: drive pin leads with drive");
+  Check(ConfiguredHostCount() == 4,
+        "policy: drive pinned replaces github in the chain; keyless still last");
+
+  CoverPublisher::ConfigureHost("auto");
+  Check(ConfiguredHostName(0) == "drive.google.com",
+        "policy: auto prefers drive when configured");
+
+  CoverPublisher::ConfigureDrive("", "", "");
+  Check(!DriveUploadActive(), "policy: empty drive credentials -> inactive");
+  Check(ConfiguredHostCount() == 4,
+        "policy: with drive off and github on the chain is github + the three keyless hosts");
+
+  CoverPublisher::ConfigureHost("auto");
+  CoverPublisher::ConfigureAuth("", "");
+  Check(ConfiguredHostCount() == 3, "policy: resetting every host restores the keyless chain");
+}
+
+// --- Drive permission classification ---------------------------------------
+
+void TestDrivePermissionClassification() {
+  Check(ClassifyDrivePermission(200, "") == DrivePermissionVerdict::kGranted,
+        "permission: 200 is a fresh grant");
+  Check(ClassifyDrivePermission(201, "") == DrivePermissionVerdict::kGranted,
+        "permission: 201 is a fresh grant");
+  Check(ClassifyDrivePermission(204, "") == DrivePermissionVerdict::kGranted,
+        "permission: another 2xx is a fresh grant");
+
+  Check(ClassifyDrivePermission(409, "") == DrivePermissionVerdict::kAlreadyShared,
+        "permission: 409 is already shared");
+  Check(ClassifyDrivePermission(
+            409, "{\"error\":{\"code\":409,\"message\":\"The permission already exists for the file\"}}") ==
+            DrivePermissionVerdict::kAlreadyShared,
+        "permission: 409 with the already-exists body is already shared");
+
+  Check(ClassifyDrivePermission(403, "") == DrivePermissionVerdict::kDenied,
+        "permission: 403 is a denial");
+  Check(ClassifyDrivePermission(
+            403, "{\"error\":{\"message\":\"The permission already exists for the file\"}}") ==
+            DrivePermissionVerdict::kDenied,
+        "permission: 403 stays a denial even when its body claims already-exists");
+
+  Check(ClassifyDrivePermission(400, "") == DrivePermissionVerdict::kRejected,
+        "permission: 400 is a rejected request");
+  Check(ClassifyDrivePermission(400, "{\"error\":{\"message\":\"The permission already exists\"}}") ==
+            DrivePermissionVerdict::kRejected,
+        "permission: 400 stays a rejection even with an already-exists body");
+
+  Check(ClassifyDrivePermission(422, "{\"error\":{\"reason\":\"alreadyExists\"}}") ==
+            DrivePermissionVerdict::kAlreadyShared,
+        "permission: a 4xx (not 400/403) with alreadyExists is already shared");
+  Check(ClassifyDrivePermission(422, "The permission is ALREADY SHARED for this file") ==
+            DrivePermissionVerdict::kAlreadyShared,
+        "permission: the already-shared wording is matched case-insensitively");
+  Check(ClassifyDrivePermission(422, "boom") == DrivePermissionVerdict::kRejected,
+        "permission: a 4xx without the wording is rejected");
+  Check(ClassifyDrivePermission(500, "") == DrivePermissionVerdict::kRejected,
+        "permission: a 5xx is rejected");
+}
+
+// --- Host policy on the cache-upgrade path ---------------------------------
+
+void TestCacheUpgradePolicy() {
+  // keyless must never reach GitHub or Drive, whatever the credentials.
+  const std::vector<PermanentHost> keyless =
+      PlanCacheUpgrade(CoverHostPolicy::kKeyless, true, true);
+  Check(keyless.empty(), "upgrade policy: keyless selects no permanent host at all");
+
+  // auto with Drive credentials yields Drive first, and does not also try GitHub.
+  const std::vector<PermanentHost> auto_drive =
+      PlanCacheUpgrade(CoverHostPolicy::kAuto, true, true);
+  Check(auto_drive.size() == 1 && auto_drive[0] == PermanentHost::kDrive,
+        "upgrade policy: auto + Drive creds upgrades to Drive first");
+
+  const std::vector<PermanentHost> auto_github =
+      PlanCacheUpgrade(CoverHostPolicy::kAuto, false, true);
+  Check(auto_github.size() == 1 && auto_github[0] == PermanentHost::kGitHub,
+        "upgrade policy: auto without Drive creds upgrades to GitHub");
+
+  Check(PlanCacheUpgrade(CoverHostPolicy::kAuto, false, false).empty(),
+        "upgrade policy: auto with no credentials offers no upgrade");
+
+  const std::vector<PermanentHost> github =
+      PlanCacheUpgrade(CoverHostPolicy::kGithub, true, true);
+  Check(github.size() == 1 && github[0] == PermanentHost::kGitHub,
+        "upgrade policy: CoverHost=github yields GitHub first");
+
+  const std::vector<PermanentHost> drive =
+      PlanCacheUpgrade(CoverHostPolicy::kDrive, true, true);
+  Check(drive.size() == 1 && drive[0] == PermanentHost::kDrive,
+        "upgrade policy: CoverHost=drive yields Drive first");
+
+  Check(PlanCacheUpgrade(CoverHostPolicy::kDrive, false, true).empty(),
+        "upgrade policy: drive pinned without credentials offers no upgrade");
+
+  // The cache action follows the same decision: keyless revalidates instead of
+  // uploading anywhere, and any permanent host upgrades.
+  const std::string ephemeral = "https://n.uguu.se/nUoxUKCo.png";
+  Check(PlanCachedUrl(ephemeral, !keyless.empty()) == CachedUrlAction::kRevalidate,
+        "upgrade policy: a keyless policy revalidates an ephemeral hit");
+  Check(PlanCachedUrl(ephemeral, !auto_drive.empty()) == CachedUrlAction::kUpgradeToPermanent,
+        "upgrade policy: auto + Drive upgrades an ephemeral hit");
+
+  // The same decision through the live configuration the plugin uses.
+  CoverPublisher::ConfigureAuth("test-token", "");
+  CoverPublisher::ConfigureDrive("client-id", "client-secret", "C:\\temp\\drive-token.txt");
+  CoverPublisher::ConfigureHost("keyless");
+  Check(CurrentUpgradeHosts().empty(),
+        "upgrade policy: the live keyless chain offers no upgrade host");
+  CoverPublisher::ConfigureHost("auto");
+  const std::vector<PermanentHost> live = CurrentUpgradeHosts();
+  Check(live.size() == 1 && live[0] == PermanentHost::kDrive,
+        "upgrade policy: the live auto chain upgrades to Drive first");
+
+  CoverPublisher::ConfigureDrive("", "", "");
+  CoverPublisher::ConfigureHost("auto");
+  CoverPublisher::ConfigureAuth("", "");
+  Check(CurrentUpgradeHosts().empty(),
+        "upgrade policy: with no credentials the live chain offers no upgrade host");
+}
+
+// --- Consent deadline arithmetic -------------------------------------------
+
+void TestConsentDeadline() {
+  // Remaining time never goes negative.
+  Check(RemainingMillis(1000, 250) == 750, "deadline: the remaining budget is exact");
+  Check(RemainingMillis(1000, 999) == 1, "deadline: the last millisecond remains a millisecond");
+  Check(RemainingMillis(1000, 1000) == 0, "deadline: nothing remains at the deadline");
+  Check(RemainingMillis(1000, 5000) == 0, "deadline: nothing remains past the deadline");
+
+  // A blocking receive can never outlive the deadline, however small the cap.
+  Check(ReceiveSliceMillis(1000, 0, 2000) == 1000,
+        "deadline: a slice is clamped to what remains");
+  Check(ReceiveSliceMillis(10000, 0, 2000) == 2000,
+        "deadline: a long budget is capped by the receive timeout");
+  Check(ReceiveSliceMillis(5000, 4900, 2000) == 100,
+        "deadline: the last slice is the remainder, not the cap");
+  Check(ReceiveSliceMillis(1000, 1000, 2000) == 0,
+        "deadline: nothing blocks at the deadline");
+  Check(ReceiveSliceMillis(1000, 2000, 2000) == 0,
+        "deadline: nothing blocks past the deadline");
+  Check(ReceiveSliceMillis(1000, 0, 0) == 0, "deadline: a zero cap never blocks");
+
+  // The budgets fit inside the window, so no receive can extend it.
+  Check(kDriveConsentWindowMs <= 300000, "deadline: the consent window stays at five minutes or less");
+  Check(kDriveReceiveTimeoutMs <= kDriveConsentWindowMs,
+        "deadline: a receive budget cannot outlast the window");
+  Check(kDriveConsentPollMs <= kDriveReceiveTimeoutMs,
+        "deadline: the accept poll fits inside a receive budget");
+  const long long now = NowMillis();
+  Check(RemainingMillis(now + static_cast<long long>(kDriveConsentWindowMs), now) ==
+            static_cast<long long>(kDriveConsentWindowMs),
+        "deadline: a fresh deadline is exactly the window away");
+}
+
+// --- Startup host-configuration line ---------------------------------------
+//
+// The live defect: with CoverHost=drive and valid credentials the log carried no
+// drive line at all, because the cache-hit path never reached the chain (the old
+// upgrade leg only knew GitHub, and its predicate tested credentials rather than
+// chain membership). This line makes the configured chain, and the reason a host
+// is absent, sayable in one log record.
+
+void TestHostConfigLine() {
+  HostConfigSummary auto_all;
+  auto_all.policy = CoverHostPolicy::kAuto;
+  auto_all.drive_usable = true;
+  auto_all.github_usable = true;
+  Check(FormatHostConfigLine(auto_all) ==
+            "local-cover hosts policy=auto drive=on github=off github-reason=policy keyless=on",
+        "host line: auto with Drive credentials leads with Drive and says why GitHub is idle");
+
+  HostConfigSummary pinned_drive;
+  pinned_drive.policy = CoverHostPolicy::kDrive;
+  pinned_drive.drive_usable = true;
+  pinned_drive.github_usable = true;
+  Check(FormatHostConfigLine(pinned_drive) ==
+            "local-cover hosts policy=drive drive=on github=off github-reason=policy keyless=on",
+        "host line: CoverHost=drive reports drive on, github off by policy");
+
+  HostConfigSummary drive_missing;
+  drive_missing.policy = CoverHostPolicy::kDrive;
+  drive_missing.drive_reason = DriveUnavailableReason(false, false, true);
+  drive_missing.github_usable = true;
+  Check(FormatHostConfigLine(drive_missing) ==
+            "local-cover hosts policy=drive drive=off drive-reason=no-credentials "
+            "github=off github-reason=policy keyless=on",
+        "host line: a pinned Drive policy with no credentials names the reason");
+
+  HostConfigSummary keyless;
+  keyless.policy = CoverHostPolicy::kKeyless;
+  keyless.drive_usable = true;
+  keyless.github_usable = true;
+  Check(FormatHostConfigLine(keyless) ==
+            "local-cover hosts policy=keyless drive=off drive-reason=policy "
+            "github=off github-reason=policy keyless=on",
+        "host line: a keyless policy reports both authenticated hosts off by policy");
+
+  HostConfigSummary github_only;
+  github_only.policy = CoverHostPolicy::kAuto;
+  github_only.github_usable = true;
+  github_only.drive_reason = DriveUnavailableReason(true, true, false);
+  Check(FormatHostConfigLine(github_only) ==
+            "local-cover hosts policy=auto drive=off drive-reason=no-state-path "
+            "github=on keyless=on",
+        "host line: an unusable sidecar path is named, and GitHub carries the chain");
+
+  // Reason tokens come from booleans only, so no configured value can leak.
+  Check(DriveUnavailableReason(false, false, false) == "no-credentials",
+        "host line: both Drive credentials missing -> no-credentials");
+  Check(DriveUnavailableReason(true, false, true) == "no-client-secret",
+        "host line: a missing client secret is named");
+  Check(DriveUnavailableReason(false, true, true) == "no-client-id",
+        "host line: a missing client id is named");
+  Check(DriveUnavailableReason(true, true, false) == "no-state-path",
+        "host line: a missing sidecar path is named");
+  Check(DriveUnavailableReason(true, true, true).empty(),
+        "host line: a usable Drive has no reason token");
+  Check(GitHubUnavailableReason(false, true) == "no-token",
+        "host line: a missing GitHub token is named");
+  Check(GitHubUnavailableReason(true, false) == "bad-repo",
+        "host line: a malformed repo is named");
+  Check(GitHubUnavailableReason(true, true).empty(),
+        "host line: a usable GitHub has no reason token");
+  Check(PolicyName(CoverHostPolicy::kAuto) == "auto" &&
+            PolicyName(CoverHostPolicy::kDrive) == "drive" &&
+            PolicyName(CoverHostPolicy::kGithub) == "github" &&
+            PolicyName(CoverHostPolicy::kKeyless) == "keyless",
+        "host line: every policy has its name");
+
+  // The live shape: the publisher reports the same line through EmitLog, and a
+  // secret set for the host never appears anywhere in it.
+  CoverPublisher::SetLogger(&CaptureLog);
+  g_log_lines.clear();
+  CoverPublisher::ConfigureDrive("client-id-value", "GOCSPX-secret-value", "C:\\temp\\state.txt");
+  CoverPublisher::ConfigureAuth("github-token-value", "owner/repo");
+  CoverPublisher::ConfigureHost("drive");
+  CoverPublisher::LogHostConfiguration();
+  CoverPublisher::SetLogger(nullptr);
+  Check(g_log_lines.size() == 1, "host line: exactly one line is emitted per call");
+  if (!g_log_lines.empty()) {
+    const std::string& line = g_log_lines[0];
+    Check(line.find("policy=drive") != std::string::npos &&
+              line.find("drive=on") != std::string::npos &&
+              line.find("keyless=on") != std::string::npos,
+          "host line: the live line names the policy and both participating hosts");
+    Check(line.find("GOCSPX") == std::string::npos &&
+              line.find("secret-value") == std::string::npos &&
+              line.find("github-token-value") == std::string::npos &&
+              line.find("client-id-value") == std::string::npos,
+          "host line: no credential value can reach the log");
+  }
+  g_log_lines.clear();
+  CoverPublisher::ConfigureAuth("", "");
+  CoverPublisher::ConfigureDrive("", "", "");
+  CoverPublisher::ConfigureHost("auto");
+}
+
+// --- Cache hits name their host --------------------------------------------
+
+void TestCacheHitHost(const std::wstring& directory) {
+  const std::string github_name(64, 'a');
+  Check(HostNameForUrl("https://files.catbox.moe/a1b2c3.png") == "catbox.moe",
+        "cache host: a catbox url names catbox.moe");
+  Check(HostNameForUrl("https://n.uguu.se/nUoxUKCo.png") == "uguu.se",
+        "cache host: a uguu url names uguu.se");
+  Check(HostNameForUrl("https://litter.catbox.moe/abc123.jpg") == "litter.catbox.moe",
+        "cache host: a litterbox url names litter.catbox.moe");
+  Check(HostNameForUrl("https://raw.githubusercontent.com/nathwn12/art/main/covers/" +
+                       github_name + ".jpg") == "github.com",
+        "cache host: a github raw url names github.com");
+  Check(HostNameForUrl(DriveLh3Url("1AbCdEfGhIjKlMnOpQrStUvWxYz0123")) == "drive.google.com",
+        "cache host: a drive url names drive.google.com");
+  Check(HostNameForUrl("https://evil.test/x.png").empty(),
+        "cache host: an unknown url names nothing");
+  Check(HostNameForUrl("").empty(), "cache host: an empty url names nothing");
+
+  // The cache hit itself must carry the name: an empty Result.host is what the
+  // plugin logged as "host=unknown" on a hit-revalidated publish.
+  CreateDirectoryW(directory.c_str(), nullptr);
+  const std::wstring path = directory + L"\\host-cache.txt";
+  DeleteFileW(path.c_str());
+  CoverPublisher::Configure(Utils::ToString(path));
+  const std::string key = Sha256Hex(std::vector<unsigned char>{'h', 'o', 's', 't'});
+  const long long now = static_cast<long long>(std::time(nullptr));
+  Result stored;
+  stored.ok = true;
+  stored.url = "https://litter.catbox.moe/abc123.jpg";
+  CacheStore(key, stored, now);
+  Result hit;
+  Check(CacheLookup(key, now, &hit) && hit.host == "litter.catbox.moe",
+        "cache host: a cache hit reports the url's host, not an empty field");
+  Check(hit.ok && hit.url == stored.url, "cache host: the hit still carries the url");
+  CoverPublisher::ClearCache();
+  DeleteFileW(path.c_str());
+  RemoveDirectoryW(directory.c_str());
+}
+
+// --- Consent wait decision --------------------------------------------------
+
+void TestConsentWaitDecision() {
+  const long long deadline = 120000;  // an absolute budget in milliseconds
+
+  // (a) A run of select() timeouts never ends the wait. This is the regression
+  // that collapsed the window to ~500 ms: two 250 ms poll ticks were counted as
+  // accepted connections.
+  bool kept_waiting = true;
+  for (long long now = 0; now < deadline; now += static_cast<long long>(kDriveConsentPollMs)) {
+    kept_waiting = kept_waiting &&
+                   DecideConsentStep(0, false, now, deadline) == ConsentStep::kKeepWaiting;
+  }
+  Check(kept_waiting, "consent wait: every select() timeout keeps waiting");
+  Check(deadline / static_cast<long long>(kDriveConsentPollMs) > 100,
+        "consent wait: the window spans many poll ticks, so a tick must not consume it");
+
+  // (b) The absolute deadline ends it, ready socket or not.
+  Check(DecideConsentStep(0, false, deadline, deadline) == ConsentStep::kExpired,
+        "consent wait: the deadline ends an idle wait");
+  Check(DecideConsentStep(1, false, deadline + 1, deadline) == ConsentStep::kExpired,
+        "consent wait: the deadline ends the wait even with a ready socket");
+
+  // (c) Cancellation ends it immediately, and outranks the deadline.
+  Check(DecideConsentStep(0, true, 0, deadline) == ConsentStep::kCancelled,
+        "consent wait: cancellation ends an idle wait");
+  Check(DecideConsentStep(1, true, 0, deadline) == ConsentStep::kCancelled,
+        "consent wait: cancellation ends the wait with a ready socket");
+  Check(DecideConsentStep(1, true, deadline, deadline) == ConsentStep::kCancelled,
+        "consent wait: cancellation outranks the deadline");
+
+  // (d) A ready socket proceeds to accept; a select error does not.
+  Check(DecideConsentStep(1, false, 0, deadline) == ConsentStep::kAccept,
+        "consent wait: a ready socket proceeds to accept");
+  Check(DecideConsentStep(3, false, deadline - 1, deadline) == ConsentStep::kAccept,
+        "consent wait: a ready socket proceeds even on the last millisecond");
+  Check(DecideConsentStep(-1, false, 0, deadline) == ConsentStep::kKeepWaiting,
+        "consent wait: a select error is not a connection and keeps waiting");
+}
+
+// --- Consent error token ----------------------------------------------------
+
+bool IsClosedSetConsentToken(const std::string& token) {
+  return token == "access_denied" || token == "invalid_scope" || token == "invalid_request" ||
+         token == "error";
+}
+
+void TestConsentErrorToken() {
+  Check(ConsentErrorToken("access_denied") == "access_denied",
+        "consent error: access_denied is kept");
+  Check(ConsentErrorToken("invalid_scope") == "invalid_scope",
+        "consent error: invalid_scope is kept");
+  Check(ConsentErrorToken("invalid_request") == "invalid_request",
+        "consent error: invalid_request is kept");
+  Check(ConsentErrorToken("server_error") == "error",
+        "consent error: any other Google code becomes error");
+  Check(ConsentErrorToken("") == "error", "consent error: an empty value becomes error");
+
+  // Anything a crafted callback can carry - newlines, quotes, a token-shaped
+  // string - must map to a fixed token and never reach the log.
+  const char* hostile[] = {
+      "access_denied\r\nlocal-cover published host=evil url=https://evil.test/x.jpg",
+      "access_denied\ntext after a bare newline",
+      "\"quoted\"",
+      "1//0gAbCdEfGhIjKlMnOpQrStUvWxYz012345",
+      "GOCSPX-secret-shaped",
+      "access_denied ",
+      "ACCESS_DENIED",
+      "%0D%0Ainjected",
+      "error",
+      "temporarily_unavailable",
+  };
+  for (size_t i = 0; i < sizeof(hostile) / sizeof(hostile[0]); ++i) {
+    const std::string token = ConsentErrorToken(hostile[i]);
+    const std::string label = "consent error: hostile input " + std::to_string(i) + " ";
+    Check(IsClosedSetConsentToken(token), label + "maps to a closed-set token");
+    Check(token.find('\r') == std::string::npos && token.find('\n') == std::string::npos &&
+              token.find('"') == std::string::npos && token.find(' ') == std::string::npos,
+          label + "yields no whitespace or quotes");
+    Check(token.find("GOCSPX") == std::string::npos && token.find("1//0g") == std::string::npos &&
+              token.find("evil") == std::string::npos,
+          label + "cannot carry a token-shaped or injected value");
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1600,6 +2268,21 @@ int main(int argc, char** argv) {
   TestSidecarSelection();
   TestCache(directory);
   TestCachedUrlPlan();
+  TestDrivePkce();
+  TestDriveAuthUrl();
+  TestDriveTokenState(directory);
+  TestDriveFolderQuery();
+  TestDriveMultipart();
+  TestDriveLh3Url();
+  TestDriveCacheLine();
+  TestCoverHostSelection();
+  TestDrivePermissionClassification();
+  TestCacheUpgradePolicy();
+  TestConsentDeadline();
+  TestHostConfigLine();
+  TestCacheHitHost(directory);
+  TestConsentWaitDecision();
+  TestConsentErrorToken();
 
   std::printf("cover_publisher tests: %d checks, %d failures\n", g_checks, g_failures);
   std::printf("RESULT: %s\n", g_failures == 0 ? "PASS" : "FAIL");
