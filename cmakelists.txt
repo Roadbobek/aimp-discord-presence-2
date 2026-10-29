@@ -17,8 +17,9 @@ add_compile_options( /W4 /WX )
 
 add_subdirectory( ${SRC_DIR} )
 
-# --- Unit tests -------------------------------------------------------------
-#
+# --- Unit tests ---------------------------------------------------------------
+
+# Cover Payload Tests
 # Offline tests for the pure Discord payload builders. The test binary compiles
 # src/discord_ipc.cpp directly, so there is one implementation and no mock.
 # No third-party framework and no network are involved.
@@ -30,3 +31,28 @@ add_executable( payload_tests
 )
 target_include_directories( payload_tests PRIVATE ${SRC_DIR} )
 add_test( NAME payload_tests COMMAND payload_tests )
+
+# Cover Publisher Tests
+# Offline tests for the album art pipeline (fetch, resize, local fallback).
+# The test binary compiles the real cover_publisher, album_art, and
+# local_art sources directly — no mocks, no network, no third-party
+# framework. winhttp is linked for the HTTP layer symbols but no
+# requests are made at runtime.
+add_executable( cover_publisher_tests
+        tests/cover_publisher_tests.cpp
+        ${SRC_DIR}/cover_publisher.cpp
+        ${SRC_DIR}/album_art.cpp
+        ${SRC_DIR}/local_art.cpp
+)
+
+target_include_directories( cover_publisher_tests PRIVATE
+        ${LIB_DIR}/aimp-sdk/Sources/Cpp
+        ${LIB_DIR}/aimp-glue
+        ${SRC_DIR}
+)
+
+target_link_libraries( cover_publisher_tests PRIVATE
+        winhttp
+)
+
+add_test( NAME cover_publisher_tests COMMAND cover_publisher_tests )

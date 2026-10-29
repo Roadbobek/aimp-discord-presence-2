@@ -1,0 +1,66 @@
+- Download:
+git clone --recursive https://github.com/Roadbobek/aimp-discord-presence-2
+
+- Update:
+git pull origin main
+
+- Manual build (Windows x64):
+cmake -B build -A x64 -DAUTOVERSIONING=ON
+cmake --build build --config Release
+
+- Manual build (Windows x32):
+cmake -B build -A Win32 -DAUTOVERSIONING=ON
+cmake --build build --config Release
+
+(Note, ARM versions of AIMP use a compatibility layer, so a seperate version is not needed.)
+
+- Run unit tests (payload_tests + cover_publisher_tests):
+cmake -B build -A x64 -DAUTOVERSIONING=ON
+cmake --build build --config Release
+ctest --test-dir build -C Release
+
+
+
+
+- Issues to be resolved:
+
+- - Unintended local image exfiltration via ancestor directory traversal:
+Location:
+    LocalArt::FindSidecarArt function (originating from local_art.cpp/.h) used within the
+    AimpDiscordPresence::ExtractLocalArt function (originating from the AimpDiscordPresence namespace inside
+    aimp_discord_presence.cpp), with the problematic variable kMaxSidecarLevels used within FindSidecarArt originating
+    from local_art.h.
+Mechanics and impact:
+    By default (UseAlbumArt = true, LocalCover = true), the plugin automatically extracts local artwork and uploads it
+    to third-party image hosts(catbox.moe first, which hosts files anonymously and permanently without a deletion token).
+    When a track has no embedded cover art, LocalArt::FindSidecarArt walks up to kMaxSidecarLevels = 4 ancestor directories
+    above the audio file searching for cover.*, folder.*, front.*, album.*, or albumart*.*.
+    If a user plays an untagged audio file from C:\Users\<User>\Downloads\clip.mp3 or C:\Users\<User>\Documents\Music\clip.mp3,
+    walking up 4 parent directories reaches C:\Users\<User> and C:\Users. Any matching image file in those parent folders
+    is silently uploaded to catbox.moe.
+Remediation:
+    Restrict sidecar search to the track's immediate directory, or at most 1 parent directory if it is not the user
+    profile / home / downloads root.
+    Or let the user decide (within AIMP.ini config file) how many parent directories to search while checking and
+    blocking searches within dangerous or sensitive directories.
+
+- - Asynchronous artwork results ignored or lost while paused:
+Location:
+    AimpDiscordPresence::OnPropertyValue, AimpDiscordPresence::OnPlayerUpdatePosition, AimpDiscordPresence::ApplyPendingArtwork, AimpDiscordPresence::CoverWorkerMain
+Mechanics and impact:
+    OnPropertyValue and OnPlayerUpdatePosition return early when player.State() != kPlayerStatePlaying.
+    If a user starts a track and pauses it before the background cover upload or online artwork lookup completes, ApplyPendingArtwork() is never called while paused, leaving the paused Discord Rich Presence card without artwork.
+    Additionally, CoverWorkerMain writes into a single-slot output buffer (cover_result_*); if a second job completes before ApplyPendingArtwork() drains the first, the first result is overwritten before being cached in local_cover_urls_.
+
+- - Flawed file vs directory distinction and drive root listing in FindSidecarArt:
+Location:
+    LocalArt::FindSidecarArt
+Mechanics and impact:
+    names_a_file (local_art.cpp, 250-252) determines whether the input path is a file by checking directory.find_last_of(L'.') > last_separator. A directory containing a dot (e.g., D:\Music\Album Vol. 1) is misclassified as a file and has its leaf folder stripped; a file
+    without an extension is misclassified as a directory.
+    If an audio file resides at a drive root (e.g., E:\track.flac), directory.erase(last_separator) leaves L"E:", and level 0 enumerates E:\*, contradicting the comment on line 267 (67) ("never the drive root listing").
+Remediation:
+    Use GetFileAttributesW (checking FILE_ATTRIBUTE_DIRECTORY) or std::filesystem::path to distinguish files from directories and check IsDirectoryRoot before level 0 enumeration.
+
+- - Plaintext storage of API tokens and OAuth secrets:
+im tired boss, i dont use this so idc rn.
