@@ -40,9 +40,7 @@ add_test( NAME payload_tests COMMAND payload_tests )
 # requests are made at runtime.
 add_executable( cover_publisher_tests
         tests/cover_publisher_tests.cpp
-        ${SRC_DIR}/cover_publisher.cpp
         ${SRC_DIR}/album_art.cpp
-        ${SRC_DIR}/local_art.cpp
 )
 
 target_include_directories( cover_publisher_tests PRIVATE

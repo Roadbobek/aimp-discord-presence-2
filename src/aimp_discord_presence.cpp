@@ -187,9 +187,9 @@ LPWSTR AimpDiscordPresence::GetInfo(int index) {
     case Info::kName:
       return const_cast<LPWSTR>(L"Discord Presence");
     case Info::kAuthor:
-      return const_cast<LPWSTR>(L"Exle (original), nathwn12 (fork)");
+      return const_cast<LPWSTR>(L"Exle (original), nathwn12 (fork), Roadbobek (fork 2)");
     case Info::Description::kShort:
-      return const_cast<LPWSTR>(L"Discord Rich Presence for AIMP \u2014 fork of Exle's plugin");
+      return const_cast<LPWSTR>(L"Roadbobek's Discord Rich Presence for AIMP \u2014 fork of nathwn12's fork of Exle's plugin");
   }
 
   return nullptr;
@@ -284,6 +284,7 @@ void AimpDiscordPresence::LoadConfig() {
   LoadConfigValue(config, L"DiscordPresence\\CoverToken", &settings.cover_token);
   LoadConfigValue(config, L"DiscordPresence\\CoverRepo", &settings.cover_repo);
   LoadConfigValue(config, L"DiscordPresence\\CoverHost", &settings.cover_host);
+  LoadConfigValue(config, L"DiscordPresence\\LocalCoverArtDirectoryTravelMax", &settings.local_cover_art_directory_travel_max);
   LoadConfigValue(config, L"DiscordPresence\\DriveClientId", &settings.drive_client_id);
   LoadConfigValue(config, L"DiscordPresence\\DriveClientSecret", &settings.drive_client_secret);
   LoadConfigValue(config, L"DiscordPresence\\StatusDisplayType", &settings.status_display_type);

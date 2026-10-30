@@ -79,7 +79,7 @@ void Configure(const std::string& cache_path);
 // Configures the permanent, user-owned GitHub host. `token` is a fine-grained
 // personal access token; when it is empty the GitHub host is skipped entirely
 // and the chain is exactly the keyless hosts. `repo` is "owner/name" and
-// defaults to nathwn12/aimp-discord-presence-art when empty. The token is
+// defaults to Roadbobek/aimp-discord-presence-art when empty. The token is
 // never logged, cached, or persisted - only its presence is ever named.
 void ConfigureAuth(const std::string& token, const std::string& repo);
 

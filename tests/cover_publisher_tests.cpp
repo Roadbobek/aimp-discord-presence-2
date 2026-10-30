@@ -753,7 +753,7 @@ void TestCardLargeImagePlaceholder() {
 
   // The placeholder URL is pinned once, so it cannot drift silently.
   Check(std::string(kTransparentLargeImageUrl) ==
-            "https://raw.githubusercontent.com/nathwn12/aimp-discord-presence-art/"
+            "https://raw.githubusercontent.com/Roadbobek/aimp-discord-presence-art/"
             "main/covers/transparent.png",
         "card: the transparent placeholder url is pinned");
   // AppendImageField truncates at 300 characters.
@@ -1519,7 +1519,7 @@ void TestCachedUrlPlan() {
   const std::string litterbox_url = "https://litter.catbox.moe/abc123.png";
   const std::string github_name(64, 'a');
   const std::string github_url =
-      "https://raw.githubusercontent.com/nathwn12/aimp-discord-presence-art/main/covers/" +
+      "https://raw.githubusercontent.com/Roadbobek/aimp-discord-presence-art/main/covers/" +
       github_name + ".jpg";
 
   // Every keyless host's URL is ephemeral, whatever the subdomain or extension.
@@ -2120,7 +2120,7 @@ void TestCacheHitHost(const std::wstring& directory) {
         "cache host: a uguu url names uguu.se");
   Check(HostNameForUrl("https://litter.catbox.moe/abc123.jpg") == "litter.catbox.moe",
         "cache host: a litterbox url names litter.catbox.moe");
-  Check(HostNameForUrl("https://raw.githubusercontent.com/nathwn12/art/main/covers/" +
+  Check(HostNameForUrl("https://raw.githubusercontent.com/Roadbobek/art/main/covers/" +
                        github_name + ".jpg") == "github.com",
         "cache host: a github raw url names github.com");
   Check(HostNameForUrl(DriveLh3Url("1AbCdEfGhIjKlMnOpQrStUvWxYz0123")) == "drive.google.com",

@@ -186,7 +186,7 @@ const UploadHost kBaseUploadHosts[kBaseUploadHostCount] = {
 
 // The default GitHub repository: the owner's permanent art repo. CoverRepo
 // overrides it; CoverToken (empty by default) enables the host at all.
-const wchar_t kDefaultGitHubRepo[] = L"nathwn12/aimp-discord-presence-art";
+const wchar_t kDefaultGitHubRepo[] = L"Roadbobek/aimp-discord-presence-art";
 
 // The GitHub host configuration. `token` is only ever sent to api.github.com;
 // it is never logged, cached, or put into a Result. Guarded by g_host_mutex

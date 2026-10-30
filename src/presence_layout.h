@@ -74,7 +74,7 @@ constexpr const char* kFallbackDetails = "AIMP";
 // field. Defined exactly once in the tree; the URL is well under
 // AppendImageField's 300-character truncation limit.
 inline constexpr char kTransparentLargeImageUrl[] =
-    "https://raw.githubusercontent.com/nathwn12/aimp-discord-presence-art/"
+    "https://raw.githubusercontent.com/Roadbobek/aimp-discord-presence-art/"
     "main/covers/transparent.png";
 
 // Every tag value a template may substitute. Populated from the same AIMP

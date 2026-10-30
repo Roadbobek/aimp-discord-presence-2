@@ -12,13 +12,16 @@ cmake --build build --config Release
 cmake -B build -A Win32 -DAUTOVERSIONING=ON
 cmake --build build --config Release
 
-(Note, ARM versions of AIMP use a compatibility layer, so a seperate version is not needed.)
+Note, ARM versions of AIMP use a compatibility layer, so a seperate version is not needed.
 
 - Run unit tests (payload_tests + cover_publisher_tests):
 cmake -B build -A x64 -DAUTOVERSIONING=ON
 cmake --build build --config Release
 ctest --test-dir build -C Release
 
+Standard Semantic Versioning (MAJOR.MINOR.PATCH.BUILD)
+2.1.0 : (First 3 digits): Controlled by Git tags.
+.60   : (Last digit): Controlled by the number of commits since that tag was created.
 
 
 
@@ -32,7 +35,7 @@ Location:
     from local_art.h.
 Mechanics and impact:
     By default (UseAlbumArt = true, LocalCover = true), the plugin automatically extracts local artwork and uploads it
-    to third-party image hosts(catbox.moe first, which hosts files anonymously and permanently without a deletion token).
+    to third-party image hosts (catbox.moe first, which hosts files anonymously and permanently without a deletion token).
     When a track has no embedded cover art, LocalArt::FindSidecarArt walks up to kMaxSidecarLevels = 4 ancestor directories
     above the audio file searching for cover.*, folder.*, front.*, album.*, or albumart*.*.
     If a user plays an untagged audio file from C:\Users\<User>\Downloads\clip.mp3 or C:\Users\<User>\Documents\Music\clip.mp3,
@@ -64,3 +67,6 @@ Remediation:
 
 - - Plaintext storage of API tokens and OAuth secrets:
 im tired boss, i dont use this so idc rn.
+
+- - Missing keys of type std::wstring default to empty string / nothing:
+awwwwwww

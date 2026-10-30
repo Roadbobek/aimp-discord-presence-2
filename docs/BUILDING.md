@@ -14,7 +14,7 @@ key, and what to try when the presence does not appear.
 ## Installation (prebuilt)
 
 1. **Get the plugin.** Download a built release archive from the
-   [Releases page](https://github.com/nathwn12/aimp-discord-presence2/releases)
+   [Releases page](https://github.com/Roadbobek/aimp-discord-presence-2/releases)
    of this fork, or build it yourself (see [Build from source](#build-from-source)
    below).
 2. **Open the plugin installer in AIMP.** In AIMP, open **Settings** (the gear
@@ -45,8 +45,8 @@ in-repo, under `lib/aimp-glue/` (see the fork note in the [README](../README.md)
 
 ```powershell
 # Clone this fork together with its AIMP SDK submodule.
-git clone --recursive https://github.com/nathwn12/aimp-discord-presence2.git
-cd aimp-discord-presence2
+git clone --recursive https://github.com/Roadbobek/aimp-discord-presence-2.git
+cd aimp-discord-presence-2
 
 # If you cloned without --recursive, initialize the submodule instead:
 # git submodule update --init --recursive
@@ -94,9 +94,9 @@ find the Profile folder location in AIMP's settings.)
 | `UseAlbumArt` | bool | Use the album art as the large image. `0` = off, `1` = on. |
 | `UseAlbumArtOnline` | bool | Allow **network** album-art lookups (Deezer, then iTunes, then MusicBrainz + Cover Art Archive). `0` = never go online; the card keeps the plugin's built-in placeholder image. `1` = allow online lookups. |
 | `LocalCover`, `CoverCache` | bool, string | Publish the track's own (offline) cover so Discord can fetch the real artwork. `LocalCover`: `0` = off, `1` = on (default); a published cover is used only after the upload proves retrievable. The local image is uploaded through a host chain - GitHub (only when `CoverToken` is set), catbox, uguu, then litterbox - and a host failure falls through to the online lookup, never straight to the placeholder. `CoverCache`: optional file that remembers published cover URLs by image hash. Empty (the default) resolves to `cover-cache.txt` beside the plugin DLL; a bare filename resolves there too, an absolute path is used as given. |
-| `CoverToken`, `CoverRepo` | string, string | **Optional** permanent GitHub upload host. `CoverToken` is a fine-grained personal access token with `contents: write` for the repository. An **empty token (the default) is fine**: it simply omits the GitHub host, and the keyless hosts handle the upload with no behaviour change. When set, GitHub is tried first, and the token is sent **only** to `api.github.com`; it is never logged, printed, or written to `CoverCache`. `CoverRepo`: the `owner/name` repository that receives the covers; empty (the default) uses `nathwn12/aimp-discord-presence-art`. |
+| `CoverToken`, `CoverRepo` | string, string | **Optional** permanent GitHub upload host. `CoverToken` is a fine-grained personal access token with `contents: write` for the repository. An **empty token (the default) is fine**: it simply omits the GitHub host, and the keyless hosts handle the upload with no behaviour change. When set, GitHub is tried first, and the token is sent **only** to `api.github.com`; it is never logged, printed, or written to `CoverCache`. `CoverRepo`: the `owner/name` repository that receives the covers; empty (the default) uses `Roadbobek/aimp-discord-presence-art`. |
 | `StatusDisplayType` | int | What the member-list status text shows: `0` = app name, `1` = **artist** (the `state` line), `2` = **track title** (the `details` line). Default: `2`. |
-| `Name` | string | Application name shown above the activity card. Default: `Music`. Truncated to 128 characters; an empty value omits the field. |
+| `Name` | string | Application name shown above the activity card. Default: `AIMP [Roadbobek's Discord RPC]`. Truncated to 128 characters; an empty value omits the field. |
 | `Details` | string | Template for line 2 of the card. Default: `{title}`. An empty expansion falls back to the artist, then to `AIMP`, so the line is never blank. |
 | `State` | string | Template for line 3 of the card. Default: `{artist}`. An empty expansion falls back to the album; the line is omitted when it would repeat `Details`. |
 | `LargeText` | string | Template for the cover-art tooltip. Default: `{album}`. Omitted when it expands to fewer than two characters. |
@@ -156,7 +156,7 @@ UseAlbumArtOnline=1
 ; keyless chain; the token is sent only to api.github.com and is never logged or
 ; cached. CoverRepo defaults to the owner's art repository.
 CoverToken=
-CoverRepo=nathwn12/aimp-discord-presence-art
+CoverRepo=Roadbobek/aimp-discord-presence-art
 
 ; Member-list status text: 0 = app name / 1 = artist / 2 = track title. Default: 2
 StatusDisplayType=2

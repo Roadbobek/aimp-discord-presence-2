@@ -55,7 +55,7 @@ constexpr size_t kMaxUrlLength = 300;
 
 // MusicBrainz policy requires a descriptive User-Agent with a contact URL.
 constexpr const char* kUserAgent =
-    "AIMP-Discord-Presence/2.0.0 (https://github.com/nathwn12/aimp-discord-presence2)";
+    "AIMP-Discord-Presence/2.0.0 (https://github.com/Roadbobek/aimp-discord-presence-2)";
 
 enum class Provider {
   kNone = 0,

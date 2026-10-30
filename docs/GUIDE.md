@@ -249,7 +249,7 @@ settings show you where the Profile folder is) if the file is not there.
 | `CoverCache` | string | empty → `cover-cache.txt` beside the DLL | File that remembers published URLs by image hash. A bare filename resolves next to the plugin DLL; an absolute path is used as given. |
 | `CoverHost` | `auto` / `drive` / `github` / `keyless` | `auto` | Which host publishes the covers. `auto` uses Drive when `DriveClientId` and `DriveClientSecret` are both set, otherwise GitHub when `CoverToken` is set; the keyless hosts are tried either way. `drive`, `github` and `keyless` pin the preference, and the keyless hosts always remain the last resort. Case-insensitive, and a misspelt value is read as `auto`. |
 | `CoverToken` | string | empty | Your fine-grained token. **Empty skips the GitHub host entirely** and leaves only the keyless hosts. |
-| `CoverRepo` | string | `nathwn12/aimp-discord-presence-art` | The `owner/name` repository that receives the covers. Set this to **your** repository. |
+| `CoverRepo` | string | `Roadbobek/aimp-discord-presence-art` | The `owner/name` repository that receives the covers. Set this to **your** repository. |
 | `DriveClientId` | string | empty | Your Google OAuth **Desktop app** client ID. Empty keeps Drive out of the chain entirely — the setup is in section 6. |
 | `DriveClientSecret` | string | empty | The matching client secret (`GOCSPX-…`). Stored in plaintext in this file, like the token. |
 | `DebugLog` | string | empty (off) | Optional log file for the IPC frames and the cover layer/host decisions. This is the file you read when a cover does not appear. |

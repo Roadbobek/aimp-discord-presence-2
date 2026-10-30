@@ -154,12 +154,14 @@ class AimpDiscordPresence :
     // `cover_repo` is "owner/name" and defaults to the owner's art repo. The
     // token is never logged, cached, or written anywhere by the plugin.
     std::wstring cover_token;
-    std::wstring cover_repo = L"nathwn12/aimp-discord-presence-art";
+    std::wstring cover_repo = L"Roadbobek/aimp-discord-presence-art";
     // Preferred cover host: "auto" (the default) uses Google Drive when its
     // credentials exist, otherwise GitHub when a token exists, and falls back to
     // the anonymous keyless hosts either way. "drive", "github" and "keyless"
     // pin the preference; the keyless hosts always remain the last resort.
     std::wstring cover_host = L"auto";
+    // Max ancestor directories to traverse through when looking for cover art.
+    int local_cover_art_directory_travel_max = 1;
     // Google Drive upload host: the owner's own OAuth desktop client. With
     // either value empty (the default) Drive is simply absent from the chain.
     // The secret is never logged or written; the refresh token lives in
@@ -173,7 +175,7 @@ class AimpDiscordPresence :
     // Activity card text templates. `name` is the application name line above
     // the activity. Each button is emitted only when its url is an https://
     // URL; token values in a Url are percent-encoded, labels are not.
-    std::wstring name = L"Music";
+    std::wstring name = L"AIMP [Roadbobek's Discord RPC]";
     std::wstring details_template = L"{title}";
     std::wstring state_template = L"{artist}";
     std::wstring large_text_template = L"{album}";
@@ -197,7 +199,7 @@ class AimpDiscordPresence :
       std::wstring pause_image = L"aimp_pause";
       std::wstring pause_text = L"Paused";
       bool use_radio = true;
-      std::wstring radio_image = L"https://raw.githubusercontent.com/Exle/aimp-discord-presence/main/"
+      std::wstring radio_image = L"https://raw.githubusercontent.com/Roadbobek/aimp-discord-presence-2/main/"
                            L".github/aimp_icons/animated/aimp_radio.gif";
       // Empty (the default) omits small_text in radio state.
       std::wstring radio_text;
