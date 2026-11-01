@@ -915,7 +915,7 @@ LocalArt::Result AimpDiscordPresence::ExtractLocalArt(const TrackInfo& info,
     // lives in an ancestor folder). Fall back to a conventional sidecar file,
     // then hand its bytes down the exact same path the SDK result would take
     // (same size cap, same format gate, same publish).
-    const std::wstring sidecar = LocalArt::FindSidecarArt(file);
+    const std::wstring sidecar = LocalArt::FindSidecarArt(file, settings.local_cover_art_directory_travel_max);
     if (!sidecar.empty() && want_bytes) {
       sidecar_art = LocalArt::LoadSidecarBytes(sidecar);
     }

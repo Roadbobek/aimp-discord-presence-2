@@ -238,7 +238,9 @@ std::wstring FindSidecarName(const std::wstring& directory) {
   return PickBestSidecarName(names);
 }
 
-std::wstring FindSidecarArt(const std::wstring& track_path) {
+std::wstring FindSidecarArt(const std::wstring& track_path, int custom_max_dirs) {
+  const int safe_levels = (custom_max_dirs > 0) ? custom_max_dirs : 0;
+
   if (track_path.empty()) {
     return std::wstring();
   }
@@ -254,7 +256,7 @@ std::wstring FindSidecarArt(const std::wstring& track_path) {
     directory.erase(last_separator);
   }
 
-  for (int level = 0; level <= kMaxSidecarLevels; ++level) {
+  for (int level = 0; level <= safe_levels; ++level) {
     if (directory.empty()) {
       break;
     }

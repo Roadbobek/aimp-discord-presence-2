@@ -66,7 +66,7 @@ Result LoadSidecarBytes(const std::wstring& path);
 
 // Deepest number of ancestor levels above the track's own folder that the
 // sidecar scan will enter. The track folder itself is level 0.
-constexpr int kMaxSidecarLevels = 4;
+constexpr int kMaxSidecarLevels = 1;
 
 // One directory offered to the pure sidecar chooser: the directory path plus
 // its entries' file names (directories included; the extension gate filters
@@ -91,9 +91,9 @@ std::wstring PickBestSidecarName(const std::vector<std::wstring>& names);
 std::wstring FindSidecarName(const std::wstring& directory);
 
 // Walk from the track's own folder up through its ancestors, newest level
-// first, stopping after kMaxSidecarLevels ascent steps. Returns the first
+// first, stopping after custom_max_dirs ascent steps. Returns the first
 // conventional cover file found, or an empty string when none is in range.
-std::wstring FindSidecarArt(const std::wstring& track_path);
+std::wstring FindSidecarArt(const std::wstring& track_path, int custom_max_dirs = kMaxSidecarLevels);
 
 }  // namespace LocalArt
 
