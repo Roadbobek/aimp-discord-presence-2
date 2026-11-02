@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cwctype>
+#include <shlwapi.h>
 
 // SHA-256 comes from CNG; linking it here keeps the extraction leg
 // self-contained.
@@ -245,34 +246,65 @@ std::wstring FindSidecarArt(const std::wstring& track_path, int custom_max_dirs)
     return std::wstring();
   }
 
-  // Start at the track's own folder. The track path is a file path, so drop the
-  // last component; a path that names a directory instead still starts there.
   std::wstring directory = track_path;
+  DWORD attributes = GetFileAttributesW(directory.c_str());
   const size_t last_separator = directory.find_last_of(L"\\/");
-  const bool names_a_file = last_separator != std::wstring::npos &&
-                            last_separator + 1 < directory.size() &&
-                            directory.find_last_of(L'.') > last_separator;
-  if (names_a_file) {
-    directory.erase(last_separator);
+
+  if (attributes == INVALID_FILE_ATTRIBUTES)
+  {
+    return std::wstring();
   }
 
-  for (int level = 0; level <= safe_levels; ++level) {
-    if (directory.empty()) {
-      break;
+  if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+  {
+    if (last_separator != std::wstring::npos)
+    {
+      directory.erase(last_separator);
     }
-    const std::wstring name = FindSidecarName(directory);
-    if (!name.empty()) {
-      return directory + L"\\" + name;
+    else
+    {
+      directory = L"."; // current dir
     }
-
-    // Ascend one level: drop the trailing component. Stop when no separator
-    // remains, which is a bare drive like "E:" - never the drive root listing.
-    const size_t separator = directory.find_last_of(L"\\/");
-    if (separator == std::wstring::npos) {
-      break;
-    }
-    directory.erase(separator);
   }
+  else
+  {
+    if (!directory.empty() && (directory.back() == L'\\' || directory.back() == L'/'))
+    {
+      directory.pop_back();
+    }
+  }
+
+  for (int level = 0; level <= safe_levels; ++level)
+  {
+  if (directory.empty())
+  {
+    break;
+  }
+
+  if (const bool path_is_root = PathIsRootW(directory.c_str()))
+  {
+    break;
+  }
+
+  const std::wstring name = FindSidecarName(directory);
+  if (!name.empty())
+  {
+    return directory + L"\\" + name;
+  }
+
+  if (!directory.empty() && (directory.back() == L'\\' || directory.back() == L'/'))
+  {
+    directory.pop_back();
+  }
+
+  const size_t separator = directory.find_last_of(L"\\/");
+  if (separator == std::wstring::npos)
+  {
+    break;
+  }
+  directory.erase(separator);
+}
+
   return std::wstring();
 }
 

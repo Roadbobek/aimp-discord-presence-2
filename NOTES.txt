@@ -23,11 +23,9 @@ Standard Semantic Versioning (MAJOR.MINOR.PATCH.BUILD)
 2.1.0 : (First 3 digits): Controlled by Git tags.
 .60   : (Last digit): Controlled by the number of commits since that tag was created.
 
-
-
 - Issues to be resolved:
 
-- - Unintended local image exfiltration via ancestor directory traversal:
+- - [SOLVED] Unintended local image exfiltration via ancestor directory traversal:
 Location:
     LocalArt::FindSidecarArt function (originating from local_art.cpp/.h) used within the
     AimpDiscordPresence::ExtractLocalArt function (originating from the AimpDiscordPresence namespace inside
@@ -46,6 +44,28 @@ Remediation:
     profile / home / downloads root.
     Or let the user decide (within AIMP.ini config file) how many parent directories to search while checking and
     blocking searches within dangerous or sensitive directories.
+Implementation:
+    Created LocalCoverArtDirectoryTravelMax setting in AIMP.ini, defaulted to 1.
+    Fix 'Flawed file vs directory distinction' issue and add safeguards.
+
+- - [SOLVED] Flawed file vs directory distinction and drive root listing in FindSidecarArt:
+Location:
+    LocalArt::FindSidecarArt
+Mechanics and impact:
+    names_a_file (local_art.cpp, 250-252) determines whether the input path is a file by checking
+    directory.find_last_of(L'.') > last_separator. A directory containing a dot (e.g., D:\Music\Album Vol. 1) is
+    misclassified as a file and has its leaf folder stripped; a file without an extension is misclassified as a directory.
+    If an audio file resides at a drive root (e.g., E:\track.flac), directory.erase(last_separator) leaves L"E:", and
+    level 0 enumerates E:\*, contradicting the comment on line 267 (67) ("never the drive root listing").
+    Folders with dots in their names cause false positives, files without extensions cause false negatives.
+Remediation:
+    Do not guess between file and directory based on the presence of a dot or extension, instead query the OS for
+    the path's filesystem attributes.
+    Use GetFileAttributesW (checking FILE_ATTRIBUTE_DIRECTORY) or std::filesystem::path to distinguish files from
+    directories and check IsDirectoryRoot before level 0 enumeration.
+Implementation:
+    Fixed other issues, edge-cases and added safeguards, using a mix of string manipulation and native win32 API calls.
+    All contained within LocalArt::FindSidecarArt. Plus made code easier to read and maintain.
 
 - - Asynchronous artwork results ignored or lost while paused:
 Location:
@@ -54,16 +74,6 @@ Mechanics and impact:
     OnPropertyValue and OnPlayerUpdatePosition return early when player.State() != kPlayerStatePlaying.
     If a user starts a track and pauses it before the background cover upload or online artwork lookup completes, ApplyPendingArtwork() is never called while paused, leaving the paused Discord Rich Presence card without artwork.
     Additionally, CoverWorkerMain writes into a single-slot output buffer (cover_result_*); if a second job completes before ApplyPendingArtwork() drains the first, the first result is overwritten before being cached in local_cover_urls_.
-
-- - Flawed file vs directory distinction and drive root listing in FindSidecarArt:
-Location:
-    LocalArt::FindSidecarArt
-Mechanics and impact:
-    names_a_file (local_art.cpp, 250-252) determines whether the input path is a file by checking directory.find_last_of(L'.') > last_separator. A directory containing a dot (e.g., D:\Music\Album Vol. 1) is misclassified as a file and has its leaf folder stripped; a file
-    without an extension is misclassified as a directory.
-    If an audio file resides at a drive root (e.g., E:\track.flac), directory.erase(last_separator) leaves L"E:", and level 0 enumerates E:\*, contradicting the comment on line 267 (67) ("never the drive root listing").
-Remediation:
-    Use GetFileAttributesW (checking FILE_ATTRIBUTE_DIRECTORY) or std::filesystem::path to distinguish files from directories and check IsDirectoryRoot before level 0 enumeration.
 
 - - Plaintext storage of API tokens and OAuth secrets:
 im tired boss, i dont use this so idc rn.

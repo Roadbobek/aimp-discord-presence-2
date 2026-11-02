@@ -51,6 +51,7 @@ target_include_directories( cover_publisher_tests PRIVATE
 
 target_link_libraries( cover_publisher_tests PRIVATE
         winhttp
+        shlwapi
 )
 
 add_test( NAME cover_publisher_tests COMMAND cover_publisher_tests )

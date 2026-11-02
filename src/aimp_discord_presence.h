@@ -161,6 +161,7 @@ class AimpDiscordPresence :
     // pin the preference; the keyless hosts always remain the last resort.
     std::wstring cover_host = L"auto";
     // Max ancestor directories to traverse through when looking for cover art.
+    // 0 = Do not traverse any directories, 1 = traverse one directory up, etc.
     int local_cover_art_directory_travel_max = 1;
     // Google Drive upload host: the owner's own OAuth desktop client. With
     // either value empty (the default) Drive is simply absent from the chain.
