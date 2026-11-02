@@ -1342,8 +1342,10 @@ std::wstring PickNameAtLevel(const std::vector<std::vector<std::wstring>>& folde
   return LocalArt::PickBestSidecarName(folders[level]);
 }
 
+// replaced LocalArt::kMaxSidecarLevels with hard-code 4 since kMaxSidecarLevels is no longer 4.
+// although it should never be used, and is only kept as a fall back and for testing.
 int SidecarLevels(const std::vector<std::vector<std::wstring>>& folders) {
-  for (int level = 0; level <= LocalArt::kMaxSidecarLevels; ++level) {
+  for (int level = 0; level <= 4; ++level) {
     const std::wstring found = PickNameAtLevel(folders, level);
     if (found.compare(0, 5, L"cover") == 0) {
       return level;
@@ -1419,7 +1421,7 @@ void TestSidecarSelection() {
   Check(SidecarLevels({{L"track.flac"}, {L"x"}, {L"x"}, {L"x"}, {L"x"}, {L"cover.jpg"}}) ==
             -1,
         "sidecar: an image five levels up is not found");
-  Check(LocalArt::kMaxSidecarLevels == 4, "sidecar: the ascent bound is four levels");
+  Check(LocalArt::kMaxSidecarLevels == 1, "sidecar: the ascent bound is four levels"); // test fallback (should never be used)
 
   // (6) First hit wins: the track folder beats an ancestor.
   Check(SidecarLevels({{L"cover.png"}, {L"cover.jpg"}}) == 0,

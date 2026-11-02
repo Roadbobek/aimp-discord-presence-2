@@ -23,6 +23,9 @@ Standard Semantic Versioning (MAJOR.MINOR.PATCH.BUILD)
 2.1.0 : (First 3 digits): Controlled by Git tags.
 .60   : (Last digit): Controlled by the number of commits since that tag was created.
 
+- Tag current release:
+git tag -a v1.0.0 -m "Release version 1.0.0"
+
 - Issues to be resolved:
 
 - - [SOLVED] Unintended local image exfiltration via ancestor directory traversal:
