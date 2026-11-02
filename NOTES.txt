@@ -26,6 +26,9 @@ Standard Semantic Versioning (MAJOR.MINOR.PATCH.BUILD)
 - Tag current release:
 git tag -a v1.0.0 -m "Release version 1.0.0"
 
+- Tag current release:
+git tag -a v1.0.0 -m "Release version 1.0.0"
+
 - Issues to be resolved:
 
 - - [SOLVED] Unintended local image exfiltration via ancestor directory traversal:
