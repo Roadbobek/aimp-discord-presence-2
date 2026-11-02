@@ -20,8 +20,11 @@ cmake --build build --config Release
 ctest --test-dir build -C Release
 
 Standard Semantic Versioning (MAJOR.MINOR.PATCH.BUILD)
-2.1.0 : (First 3 digits): Controlled by Git tags.
-.60   : (Last digit): Controlled by the number of commits since that tag was created.
+2.1.0 : (First 3 digits): Controlled by src/product.version.
+.60   : (Last digit): Controlled by the number of total commits in repository history.
+
+- Tag current release:
+git tag -a v1.0.0 -m "Release version 1.0.0"
 
 - Issues to be resolved:
 
