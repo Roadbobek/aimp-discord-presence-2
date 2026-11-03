@@ -176,7 +176,7 @@ class AimpDiscordPresence :
     // Activity card text templates. `name` is the application name line above
     // the activity. Each button is emitted only when its url is an https://
     // URL; token values in a Url are percent-encoded, labels are not.
-    std::wstring name = L"AIMP [Roadbobek's Discord RPC]";
+    std::wstring name = L"AIMP [Roadbobek's RPC]";
     std::wstring details_template = L"{title}";
     std::wstring state_template = L"{artist}";
     std::wstring large_text_template = L"{album}";
