@@ -1,3 +1,5 @@
+# **! ! ! I've forked this to practice working on othe peoples projects and generally to practice my C++ skills, I do not seriously plan to maintain or take this seriously. ! ! !**
+
 # AIMP Discord Presence
 
 ![AIMP Discord Presence](.github/aimp-discord-312.png)
